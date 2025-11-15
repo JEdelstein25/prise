@@ -383,4 +383,5 @@ test {
     _ = @import("io/mock.zig");
     _ = @import("server.zig");
     _ = @import("msgpack.zig");
+    _ = @import("rpc.zig");
 }

@@ -21,6 +21,13 @@ zigdoc std.fmt.allocPrint
 
 Tests should live alongside the code in the same file, not in separate test files.
 
+When creating a new source file with tests, add it to the test block in src/main.zig:
+```zig
+test {
+    _ = @import("new_file.zig");
+}
+```
+
 Tests automatically use a mock event loop (src/io/mock.zig) instead of the real OS backend. This enables deterministic testing of async operations without actual I/O.
 
 To test async operations:

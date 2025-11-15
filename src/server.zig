@@ -1,11 +1,54 @@
 const std = @import("std");
 const io = @import("io.zig");
+const rpc = @import("rpc.zig");
+const msgpack = @import("msgpack.zig");
 const posix = std.posix;
 
 const Client = struct {
     fd: posix.fd_t,
     server: *Server,
     recv_buffer: [4096]u8 = undefined,
+
+    fn handleMessage(self: *Client, loop: *io.Loop, data: []const u8) !void {
+        const msg = try rpc.decodeMessage(self.server.allocator, data);
+        defer msg.deinit(self.server.allocator);
+
+        switch (msg) {
+            .request => |req| {
+                std.log.info("Got request: msgid={} method={s}", .{ req.msgid, req.method });
+
+                // Dispatch to handler
+                const result = try self.server.handleRequest(req.method, req.params);
+                defer result.deinit(self.server.allocator);
+
+                // Send response: [1, msgid, error, result]
+                // Build response array manually since we have a Value
+                const response_arr = try self.server.allocator.alloc(msgpack.Value, 4);
+                defer self.server.allocator.free(response_arr);
+                response_arr[0] = msgpack.Value{ .unsigned = 1 }; // type
+                response_arr[1] = msgpack.Value{ .unsigned = req.msgid }; // msgid
+                response_arr[2] = msgpack.Value.nil; // no error
+                response_arr[3] = result; // result
+
+                const response_value = msgpack.Value{ .array = response_arr };
+                const response = try msgpack.encodeFromValue(self.server.allocator, response_value);
+                defer self.server.allocator.free(response);
+
+                _ = try loop.send(self.fd, response, .{
+                    .ptr = null,
+                    .cb = struct {
+                        fn noop(_: *io.Loop, _: io.Completion) anyerror!void {}
+                    }.noop,
+                });
+            },
+            .notification => |notif| {
+                std.log.info("Got notification: method={s}", .{notif.method});
+            },
+            .response => {
+                std.log.warn("Client sent response, ignoring", .{});
+            },
+        }
+    }
 
     fn onRecv(loop: *io.Loop, completion: io.Completion) anyerror!void {
         const client = completion.userdataCast(Client);
@@ -16,7 +59,13 @@ const Client = struct {
                     // EOF - client disconnected
                     client.server.removeClient(client);
                 } else {
-                    // Got data, ignore for now and keep receiving
+                    // Got data, try to parse as RPC message
+                    const data = client.recv_buffer[0..bytes_read];
+                    client.handleMessage(loop, data) catch |err| {
+                        std.log.err("Failed to handle message: {}", .{err});
+                    };
+
+                    // Keep receiving
                     _ = try loop.recv(client.fd, &client.recv_buffer, .{
                         .ptr = client,
                         .cb = onRecv,
@@ -40,6 +89,19 @@ const Server = struct {
     pty_count: usize = 0,
     accepting: bool = true,
     accept_task: ?io.Task = null,
+
+    fn handleRequest(self: *Server, method: []const u8, params: msgpack.Value) !msgpack.Value {
+        _ = params;
+
+        if (std.mem.eql(u8, method, "ping")) {
+            return msgpack.Value{ .string = try self.allocator.dupe(u8, "pong") };
+        } else if (std.mem.eql(u8, method, "spawn_pty")) {
+            // TODO: implement
+            return msgpack.Value{ .integer = 1 }; // Return PTY ID for now
+        } else {
+            return msgpack.Value{ .string = try self.allocator.dupe(u8, "unknown method") };
+        }
+    }
 
     fn shouldExit(self: *Server) bool {
         return self.clients.items.len == 0 and self.pty_count == 0;

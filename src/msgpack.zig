@@ -25,6 +25,74 @@ pub fn encode(allocator: Allocator, value: anytype) EncodeError![]u8 {
     return buf.toOwnedSlice(allocator);
 }
 
+pub fn encodeFromValue(allocator: Allocator, value: Value) EncodeError![]u8 {
+    var buf = std.ArrayList(u8).empty;
+    errdefer buf.deinit(allocator);
+    try encodeValueType(allocator, &buf, value);
+    return buf.toOwnedSlice(allocator);
+}
+
+fn encodeValueType(allocator: Allocator, buf: *std.ArrayList(u8), value: Value) EncodeError!void {
+    switch (value) {
+        .nil => try encodeNil(allocator, buf),
+        .boolean => |b| try encodeBool(allocator, buf, b),
+        .integer => |i| try encodeInt(allocator, buf, i),
+        .unsigned => |u| try encodeInt(allocator, buf, u),
+        .float => |f| try encodeFloat(allocator, buf, f),
+        .string => |s| try encodeString(allocator, buf, s),
+        .binary => |b| try encodeString(allocator, buf, b),
+        .array => |arr| {
+            const len = arr.len;
+            if (len > 0xffffffff) return error.ArrayTooLong;
+
+            if (len <= 15) {
+                try buf.append(allocator, 0x90 | @as(u8, @intCast(len)));
+            } else if (len <= 0xffff) {
+                try buf.append(allocator, 0xdc);
+                const bytes = std.mem.toBytes(@as(u16, @intCast(len)));
+                try buf.append(allocator, bytes[1]);
+                try buf.append(allocator, bytes[0]);
+            } else {
+                try buf.append(allocator, 0xdd);
+                const bytes = std.mem.toBytes(@as(u32, @intCast(len)));
+                try buf.append(allocator, bytes[3]);
+                try buf.append(allocator, bytes[2]);
+                try buf.append(allocator, bytes[1]);
+                try buf.append(allocator, bytes[0]);
+            }
+
+            for (arr) |item| {
+                try encodeValueType(allocator, buf, item);
+            }
+        },
+        .map => |m| {
+            const len = m.len;
+            if (len > 0xffffffff) return error.MapTooLong;
+
+            if (len <= 15) {
+                try buf.append(allocator, 0x80 | @as(u8, @intCast(len)));
+            } else if (len <= 0xffff) {
+                try buf.append(allocator, 0xde);
+                const bytes = std.mem.toBytes(@as(u16, @intCast(len)));
+                try buf.append(allocator, bytes[1]);
+                try buf.append(allocator, bytes[0]);
+            } else {
+                try buf.append(allocator, 0xdf);
+                const bytes = std.mem.toBytes(@as(u32, @intCast(len)));
+                try buf.append(allocator, bytes[3]);
+                try buf.append(allocator, bytes[2]);
+                try buf.append(allocator, bytes[1]);
+                try buf.append(allocator, bytes[0]);
+            }
+
+            for (m) |kv| {
+                try encodeValueType(allocator, buf, kv.key);
+                try encodeValueType(allocator, buf, kv.value);
+            }
+        },
+    }
+}
+
 fn encodeValue(allocator: Allocator, buf: *std.ArrayList(u8), value: anytype) EncodeError!void {
     const T = @TypeOf(value);
     const info = @typeInfo(T);
@@ -212,7 +280,7 @@ fn encodeArray(allocator: Allocator, buf: *std.ArrayList(u8), value: anytype) !v
         try buf.append(allocator, bytes[0]);
     }
 
-    for (value) |item| {
+    inline for (value) |item| {
         try encodeValue(allocator, buf, item);
     }
 }
