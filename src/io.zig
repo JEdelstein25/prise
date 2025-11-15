@@ -40,6 +40,7 @@ pub const Result = union(enum) {
     recv: usize,
     send: usize,
     close: void,
+    timer: void,
     err: anyerror,
 };
 

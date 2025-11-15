@@ -17,6 +17,10 @@ const Session = struct {
     terminal: ghostty_vt.Terminal,
     allocator: std.mem.Allocator,
 
+    // Synchronization for terminal access
+    terminal_mutex: std.Thread.Mutex = .{},
+    dirty: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
     fn init(allocator: std.mem.Allocator, id: usize, pty_instance: pty.Pty, size: pty.winsize) !*Session {
         const session = try allocator.create(Session);
         session.* = .{
@@ -61,15 +65,10 @@ const Session = struct {
         }
     }
 
-    fn broadcast(self: *Session, loop: *io.Loop, data: []const u8) void {
-        for (self.clients.items) |client| {
-            client.sendData(loop, data) catch |err| {
-                std.log.err("Failed to send to client: {}", .{err});
-            };
-        }
-    }
+    // Removed broadcast - we'll send msgpack-RPC redraw notifications instead
 
     fn readThread(self: *Session, server: *Server) void {
+        _ = server;
         var buffer: [4096]u8 = undefined;
 
         var handler = vt_handler.Handler.init(&self.terminal);
@@ -100,22 +99,18 @@ const Session = struct {
             };
             if (n == 0) break;
 
+            // Lock mutex and update terminal state
+            self.terminal_mutex.lock();
+            defer self.terminal_mutex.unlock();
+
             // Parse the data through ghostty-vt to update terminal state
             stream.nextSlice(buffer[0..n]) catch |err| {
                 std.log.err("Failed to parse VT sequences: {}", .{err});
                 continue;
             };
 
-            // Log the terminal screen contents
-            const screen = self.terminal.plainString(self.allocator) catch |err| {
-                std.log.err("Failed to get terminal screen: {}", .{err});
-                self.broadcast(server.loop, buffer[0..n]);
-                continue;
-            };
-            defer self.allocator.free(screen);
-            std.log.debug("Session {} screen:\n{s}", .{ self.id, screen });
-
-            self.broadcast(server.loop, buffer[0..n]);
+            // Mark as dirty so main thread will send redraw
+            self.dirty.store(true, .release);
         }
         std.log.info("PTY read thread exiting for session {}", .{self.id});
 
@@ -125,12 +120,141 @@ const Session = struct {
     }
 };
 
+/// Captured screen state for building redraw notifications
+const ScreenState = struct {
+    rows: usize,
+    cols: usize,
+    cursor_x: usize,
+    cursor_y: usize,
+    cells: []CellData,
+    allocator: std.mem.Allocator,
+
+    const CellData = struct {
+        text: []const u8, // UTF-8 encoded
+        style_id: u16,
+        wide: bool, // true if this cell is wide (occupies 2 columns)
+    };
+
+    fn init(allocator: std.mem.Allocator, terminal: *ghostty_vt.Terminal, mutex: *std.Thread.Mutex) !ScreenState {
+        mutex.lock();
+        defer mutex.unlock();
+
+        const screen = terminal.screens.active;
+        const page = &screen.cursor.page_pin.node.data;
+
+        const rows = page.size.rows;
+        const cols = page.size.cols;
+        const total_cells = rows * cols;
+
+        var cells = try allocator.alloc(CellData, total_cells);
+        errdefer allocator.free(cells);
+
+        var utf8_buf: [4]u8 = undefined;
+        var grapheme_buf: [32]u21 = undefined; // Support multi-codepoint graphemes
+
+        for (0..rows) |y| {
+            const row = page.getRow(y);
+            const row_cells = page.getCells(row);
+
+            var x: usize = 0;
+            while (x < cols) : (x += 1) {
+                const cell = &row_cells[x];
+                const idx = y * cols + x;
+
+                // Skip spacer tails (second half of wide chars)
+                if (cell.wide == .spacer_tail) {
+                    cells[idx] = .{
+                        .text = try allocator.dupe(u8, ""),
+                        .style_id = 0,
+                        .wide = false,
+                    };
+                    continue;
+                }
+
+                // Extract text
+                var text: []const u8 = "";
+                var cluster: []const u21 = &[_]u21{};
+
+                switch (cell.content_tag) {
+                    .codepoint => {
+                        if (cell.content.codepoint != 0) {
+                            cluster = grapheme_buf[0..1];
+                            grapheme_buf[0] = cell.content.codepoint;
+                        }
+                    },
+                    .codepoint_grapheme => {
+                        // First codepoint
+                        grapheme_buf[0] = cell.content.codepoint;
+                        var len: usize = 1;
+
+                        // Additional codepoints from grapheme map
+                        if (page.lookupGrapheme(cell)) |extra| {
+                            for (extra) |cp| {
+                                if (len >= grapheme_buf.len) break;
+                                grapheme_buf[len] = cp;
+                                len += 1;
+                            }
+                        }
+                        cluster = grapheme_buf[0..len];
+                    },
+                    .bg_color_palette, .bg_color_rgb => {
+                        // Background-only cell, treat as space
+                        cluster = &[_]u21{' '};
+                    },
+                }
+
+                // Convert codepoints to UTF-8
+                if (cluster.len > 0) {
+                    var utf8_list = std.ArrayList(u8).empty;
+                    defer utf8_list.deinit(allocator);
+
+                    for (cluster) |cp| {
+                        const len = std.unicode.utf8Encode(cp, &utf8_buf) catch continue;
+                        try utf8_list.appendSlice(allocator, utf8_buf[0..len]);
+                    }
+                    text = try utf8_list.toOwnedSlice(allocator);
+                } else {
+                    text = try allocator.dupe(u8, " ");
+                }
+
+                cells[idx] = .{
+                    .text = text,
+                    .style_id = cell.style_id,
+                    .wide = cell.wide == .wide,
+                };
+            }
+        }
+
+        return .{
+            .rows = rows,
+            .cols = cols,
+            .cursor_x = screen.cursor.x,
+            .cursor_y = screen.cursor.y,
+            .cells = cells,
+            .allocator = allocator,
+        };
+    }
+
+    fn deinit(self: *ScreenState) void {
+        for (self.cells) |cell| {
+            self.allocator.free(cell.text);
+        }
+        self.allocator.free(self.cells);
+    }
+
+    fn getCell(self: *const ScreenState, x: usize, y: usize) ?*const CellData {
+        if (x >= self.cols or y >= self.rows) return null;
+        return &self.cells[y * self.cols + x];
+    }
+};
+
 const Client = struct {
     fd: posix.fd_t,
     server: *Server,
     recv_buffer: [4096]u8 = undefined,
     send_buffer: ?[]u8 = null,
     attached_sessions: std.ArrayList(usize),
+    seen_styles: std.AutoHashMap(u16, void),
 
     fn sendData(self: *Client, loop: *io.Loop, data: []const u8) !void {
         const buf = try self.server.allocator.dupe(u8, data);
@@ -168,7 +292,7 @@ const Client = struct {
                 // std.log.info("Got request: msgid={} method={s}", .{ req.msgid, req.method });
 
                 // Dispatch to handler
-                const result = try self.server.handleRequest(req.method, req.params);
+                const result = try self.server.handleRequest(self, req.method, req.params);
                 defer result.deinit(self.server.allocator);
 
                 // Send response: [1, msgid, error, result]
@@ -238,8 +362,9 @@ const Server = struct {
     next_session_id: usize = 0,
     accepting: bool = true,
     accept_task: ?io.Task = null,
+    frame_timer: ?io.Task = null,
 
-    fn handleRequest(self: *Server, method: []const u8, params: msgpack.Value) !msgpack.Value {
+    fn handleRequest(self: *Server, client: *Client, method: []const u8, params: msgpack.Value) !msgpack.Value {
         if (std.mem.eql(u8, method, "ping")) {
             return msgpack.Value{ .string = try self.allocator.dupe(u8, "pong") };
         } else if (std.mem.eql(u8, method, "spawn_pty")) {
@@ -271,30 +396,23 @@ const Server = struct {
 
             return msgpack.Value{ .unsigned = session_id };
         } else if (std.mem.eql(u8, method, "attach_pty")) {
-            if (params != .array or params.array.len < 2 or params.array[0] != .unsigned) {
+            std.log.info("attach_pty called with params: {}", .{params});
+            if (params != .array or params.array.len < 1 or params.array[0] != .unsigned) {
+                std.log.warn("attach_pty: invalid params", .{});
                 return msgpack.Value{ .string = try self.allocator.dupe(u8, "invalid params") };
             }
             const session_id: usize = @intCast(params.array[0].unsigned);
-            const client_fd: posix.fd_t = @intCast(params.array[1].unsigned);
+
+            std.log.info("attach_pty: session_id={} client_fd={}", .{ session_id, client.fd });
 
             const session = self.sessions.get(session_id) orelse {
+                std.log.warn("attach_pty: session {} not found", .{session_id});
                 return msgpack.Value{ .string = try self.allocator.dupe(u8, "session not found") };
             };
 
-            // Find client by fd
-            var client: ?*Client = null;
-            for (self.clients.items) |c| {
-                if (c.fd == client_fd) {
-                    client = c;
-                    break;
-                }
-            }
-
-            if (client) |c| {
-                try session.addClient(self.allocator, c);
-                try c.attached_sessions.append(self.allocator, session_id);
-                std.log.info("Client {} attached to session {}", .{ c.fd, session_id });
-            }
+            try session.addClient(self.allocator, client);
+            try client.attached_sessions.append(self.allocator, session_id);
+            std.log.info("Client {} attached to session {}", .{ client.fd, session_id });
 
             return msgpack.Value{ .unsigned = session_id };
         } else if (std.mem.eql(u8, method, "write_pty")) {
@@ -433,6 +551,7 @@ const Server = struct {
                     .fd = client_fd,
                     .server = self,
                     .attached_sessions = std.ArrayList(usize).empty,
+                    .seen_styles = std.AutoHashMap(u16, void).init(self.allocator),
                 };
                 try self.clients.append(self.allocator, client);
 
@@ -461,6 +580,7 @@ const Server = struct {
         // Cleanup sessions (kill if no clients remain and not keep_alive)
         self.cleanupSessionsForClient(client);
         client.attached_sessions.deinit(self.allocator);
+        client.seen_styles.deinit();
 
         for (self.clients.items, 0..) |c, i| {
             if (c == client) {
@@ -476,6 +596,234 @@ const Server = struct {
         }) catch {};
         self.allocator.destroy(client);
         self.checkExit() catch {};
+    }
+
+    /// Convert ghostty style to Neovim HlAttrs format
+    fn convertStyle(allocator: std.mem.Allocator, terminal: *ghostty_vt.Terminal, style_id: u16) !@import("redraw.zig").UIEvent.HlAttrDefine.HlAttrs {
+        _ = allocator;
+        const redraw = @import("redraw.zig");
+
+        if (style_id == 0) {
+            // Default style - return empty attrs
+            return .{};
+        }
+
+        const screen = terminal.screens.active;
+        const page = &screen.cursor.page_pin.node.data;
+        const style = page.styles.get(page.memory, style_id);
+
+        var attrs: redraw.UIEvent.HlAttrDefine.HlAttrs = .{};
+
+        // Convert foreground color
+        switch (style.fg_color) {
+            .none => {},
+            .palette => |idx| {
+                // For palette colors, we'd need to resolve from terminal.colors
+                // For now, just use the index as-is (will need palette lookup in future)
+                _ = idx;
+            },
+            .rgb => |rgb| {
+                attrs.foreground = (@as(u32, rgb.r) << 16) | (@as(u32, rgb.g) << 8) | @as(u32, rgb.b);
+            },
+        }
+
+        // Convert background color
+        switch (style.bg_color) {
+            .none => {},
+            .palette => |idx| {
+                _ = idx;
+            },
+            .rgb => |rgb| {
+                attrs.background = (@as(u32, rgb.r) << 16) | (@as(u32, rgb.g) << 8) | @as(u32, rgb.b);
+            },
+        }
+
+        // Convert underline color
+        switch (style.underline_color) {
+            .none => {},
+            .palette => |idx| {
+                _ = idx;
+            },
+            .rgb => |rgb| {
+                attrs.special = (@as(u32, rgb.r) << 16) | (@as(u32, rgb.g) << 8) | @as(u32, rgb.b);
+            },
+        }
+
+        // Convert flags
+        attrs.bold = style.flags.bold;
+        attrs.italic = style.flags.italic;
+        attrs.reverse = style.flags.inverse;
+        attrs.strikethrough = style.flags.strikethrough;
+
+        // Handle underline variants
+        attrs.underline = switch (style.flags.underline) {
+            .none => false,
+            .single => true,
+            else => true, // double, curly, dotted, dashed all map to underline=true
+        };
+
+        return attrs;
+    }
+
+    /// Build and send redraw notification for a session to all attached clients
+    fn sendRedraw(self: *Server, loop: *io.Loop, session: *Session, state: *ScreenState) !void {
+        const redraw = @import("redraw.zig");
+
+        std.log.debug("sendRedraw: session {} has {} total clients", .{ session.id, self.clients.items.len });
+
+        // Send to each client attached to this session
+        for (self.clients.items) |client| {
+            // Check if client is attached to this session
+            var attached = false;
+            for (client.attached_sessions.items) |sid| {
+                if (sid == session.id) {
+                    attached = true;
+                    break;
+                }
+            }
+            if (!attached) {
+                std.log.debug("Client {} not attached to session {}", .{ client.fd, session.id });
+                continue;
+            }
+
+            std.log.debug("Sending redraw to client {}", .{client.fd});
+
+            var builder = redraw.RedrawBuilder.init(self.allocator);
+            defer builder.deinit();
+
+            // Send grid_resize if needed (always send for simplicity now)
+            try builder.gridResize(1, @intCast(state.cols), @intCast(state.rows));
+
+            // Track which styles we need to define
+            var styles_to_define = std.ArrayList(u16).empty;
+            defer styles_to_define.deinit(self.allocator);
+
+            // Scan all cells to find styles we haven't sent
+            for (state.cells) |cell| {
+                if (cell.style_id != 0 and !client.seen_styles.contains(cell.style_id)) {
+                    try styles_to_define.append(self.allocator, cell.style_id);
+                    try client.seen_styles.put(cell.style_id, {});
+                }
+            }
+
+            // Define new styles
+            for (styles_to_define.items) |style_id| {
+                session.terminal_mutex.lock();
+                const attrs = try convertStyle(self.allocator, &session.terminal, style_id);
+                session.terminal_mutex.unlock();
+
+                try builder.hlAttrDefine(style_id, attrs, attrs);
+            }
+
+            // Build grid_line events for each row
+            var y: usize = 0;
+            while (y < state.rows) : (y += 1) {
+                var cells_buf = std.ArrayList(redraw.UIEvent.GridLine.Cell).empty;
+                defer cells_buf.deinit(self.allocator);
+
+                var x: usize = 0;
+                while (x < state.cols) {
+                    const cell = state.getCell(x, y) orelse break;
+
+                    // Skip empty spacer tails
+                    if (cell.text.len == 0) {
+                        x += 1;
+                        continue;
+                    }
+
+                    // Count consecutive cells with same style
+                    var repeat: usize = 1;
+                    var next_x = x + 1;
+                    if (cell.wide) next_x += 1; // Skip spacer for wide char
+
+                    while (next_x < state.cols) {
+                        const next_cell = state.getCell(next_x, y) orelse break;
+                        if (next_cell.style_id != cell.style_id) break;
+                        if (!std.mem.eql(u8, next_cell.text, cell.text)) break;
+                        if (next_cell.text.len == 0) break; // Skip spacers
+
+                        repeat += 1;
+                        next_x += 1;
+                        if (next_cell.wide) next_x += 1;
+                    }
+
+                    try cells_buf.append(self.allocator, .{
+                        .text = cell.text,
+                        .hl_id = if (cell.style_id == 0) null else cell.style_id,
+                        .repeat = if (repeat > 1) @intCast(repeat) else null,
+                    });
+
+                    x = next_x;
+                }
+
+                if (cells_buf.items.len > 0) {
+                    try builder.gridLine(1, @intCast(y), 0, cells_buf.items, false);
+                }
+            }
+
+            // Send cursor position
+            try builder.gridCursorGoto(1, @intCast(state.cursor_y), @intCast(state.cursor_x));
+
+            // Flush
+            try builder.flush();
+
+            // Build and send the notification
+            const msg = try builder.build();
+            defer self.allocator.free(msg);
+
+            try client.sendData(loop, msg);
+        }
+    }
+
+    fn onFrameTimer(loop: *io.Loop, completion: io.Completion) anyerror!void {
+        const self = completion.userdataCast(Server);
+
+        switch (completion.result) {
+            .timer => {
+                // Process each dirty session
+                var it = self.sessions.iterator();
+                while (it.next()) |entry| {
+                    const session = entry.value_ptr.*;
+
+                    // Check if dirty (atomic load)
+                    if (!session.dirty.load(.acquire)) continue;
+
+                    std.log.debug("Session {} is dirty, sending redraw", .{session.id});
+
+                    // Copy screen state under mutex
+                    var state = ScreenState.init(
+                        self.allocator,
+                        &session.terminal,
+                        &session.terminal_mutex,
+                    ) catch |err| {
+                        std.log.err("Failed to copy screen state for session {}: {}", .{ session.id, err });
+                        session.dirty.store(false, .release);
+                        continue;
+                    };
+                    defer state.deinit();
+
+                    // Clear dirty flag now that we've captured the state
+                    session.dirty.store(false, .release);
+
+                    // Build and send redraw notifications
+                    self.sendRedraw(loop, session, &state) catch |err| {
+                        std.log.err("Failed to send redraw for session {}: {}", .{ session.id, err });
+                    };
+                }
+
+                // Re-schedule frame timer (8ms = ~120 FPS)
+                if (self.accepting or self.sessions.count() > 0) {
+                    self.frame_timer = try loop.timeout(8 * std.time.ns_per_ms, .{
+                        .ptr = self,
+                        .cb = onFrameTimer,
+                    });
+                }
+            },
+            .err => |err| {
+                std.log.err("Frame timer error: {}", .{err});
+            },
+            else => unreachable,
+        }
     }
 };
 
@@ -512,6 +860,7 @@ pub fn startServer(allocator: std.mem.Allocator, socket_path: []const u8) !void 
         for (server.clients.items) |client| {
             posix.close(client.fd);
             client.attached_sessions.deinit(allocator);
+            client.seen_styles.deinit();
             allocator.destroy(client);
         }
         server.clients.deinit(allocator);
@@ -526,6 +875,12 @@ pub fn startServer(allocator: std.mem.Allocator, socket_path: []const u8) !void 
     server.accept_task = try loop.accept(listen_fd, .{
         .ptr = &server,
         .cb = Server.onAccept,
+    });
+
+    // Start frame timer (8ms = ~120 FPS)
+    server.frame_timer = try loop.timeout(8 * std.time.ns_per_ms, .{
+        .ptr = &server,
+        .cb = Server.onFrameTimer,
     });
 
     // Run until server decides to exit

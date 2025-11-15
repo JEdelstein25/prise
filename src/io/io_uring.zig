@@ -13,6 +13,7 @@ pub const Loop = struct {
         ctx: root.Context,
         kind: OpKind,
         buf: []u8 = &.{},
+        timespec: linux.kernel_timespec = undefined,
     };
 
     const OpKind = enum {
@@ -22,6 +23,7 @@ pub const Loop = struct {
         recv,
         send,
         close,
+        timer,
     };
 
     pub fn init(allocator: std.mem.Allocator) !Loop {
@@ -160,6 +162,35 @@ pub const Loop = struct {
         return root.Task{ .id = id, .ctx = ctx };
     }
 
+    pub fn timeout(
+        self: *Loop,
+        nanoseconds: u64,
+        ctx: root.Context,
+    ) !root.Task {
+        const id = self.next_id;
+        self.next_id += 1;
+
+        const ts = linux.kernel_timespec{
+            .sec = @intCast(nanoseconds / std.time.ns_per_s),
+            .nsec = @intCast(nanoseconds % std.time.ns_per_s),
+        };
+
+        try self.pending.put(id, .{
+            .ctx = ctx,
+            .kind = .timer,
+            .timespec = ts,
+        });
+
+        // Get pointer to the timespec stored in the pending op
+        const op_ptr = self.pending.getPtr(id).?;
+
+        const sqe = try self.ring.get_sqe();
+        sqe.prep_timeout(&op_ptr.timespec, 0, 0);
+        sqe.user_data = id;
+
+        return root.Task{ .id = id, .ctx = ctx };
+    }
+
     pub fn cancel(self: *Loop, id: usize) !void {
         _ = self.pending.remove(id);
         // Submit cancel operation
@@ -264,6 +295,15 @@ pub const Loop = struct {
                     .msg = ctx.msg,
                     .callback = ctx.cb,
                     .result = .{ .close = {} },
+                });
+            },
+
+            .timer => {
+                try ctx.cb(self, .{
+                    .userdata = ctx.ptr,
+                    .msg = ctx.msg,
+                    .callback = ctx.cb,
+                    .result = .{ .timer = {} },
                 });
             },
         }

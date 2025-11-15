@@ -25,6 +25,7 @@ pub const Loop = struct {
         recv,
         send,
         close,
+        timer,
     };
 
     pub fn init(allocator: std.mem.Allocator) !Loop {
@@ -238,6 +239,35 @@ pub const Loop = struct {
         return root.Task{ .id = id, .ctx = ctx };
     }
 
+    pub fn timeout(
+        self: *Loop,
+        nanoseconds: u64,
+        ctx: root.Context,
+    ) !root.Task {
+        const id = self.next_id;
+        self.next_id += 1;
+
+        try self.pending.put(id, .{
+            .ctx = ctx,
+            .kind = .timer,
+        });
+
+        // Convert nanoseconds to milliseconds for kqueue timer
+        const milliseconds = nanoseconds / std.time.ns_per_ms;
+
+        var changes = [_]posix.Kevent{.{
+            .ident = id,
+            .filter = c.EVFILT.TIMER,
+            .flags = c.EV.ADD | c.EV.ENABLE | c.EV.ONESHOT,
+            .fflags = 0,
+            .data = @intCast(milliseconds),
+            .udata = id,
+        }};
+        _ = try posix.kevent(self.kq, &changes, &[_]posix.Kevent{}, null);
+
+        return root.Task{ .id = id, .ctx = ctx };
+    }
+
     pub fn cancel(self: *Loop, id: usize) !void {
         _ = self.pending.remove(id);
     }
@@ -248,8 +278,8 @@ pub const Loop = struct {
         while (true) {
             if (mode == .until_done and self.pending.count() == 0) break;
 
-            const timeout: ?*const posix.timespec = if (mode == .once) &.{ .sec = 0, .nsec = 0 } else null;
-            const n = posix.kevent(self.kq, &[_]posix.Kevent{}, events[0..], timeout) catch |err| {
+            const wait_timeout: ?*const posix.timespec = if (mode == .once) &.{ .sec = 0, .nsec = 0 } else null;
+            const n = posix.kevent(self.kq, &[_]posix.Kevent{}, events[0..], wait_timeout) catch |err| {
                 if (err == error.Unexpected) continue;
                 return err;
             };
@@ -359,6 +389,15 @@ pub const Loop = struct {
                     .msg = ctx.msg,
                     .callback = ctx.cb,
                     .result = .{ .send = bytes_sent },
+                });
+            },
+
+            .timer => {
+                try ctx.cb(self, .{
+                    .userdata = ctx.ptr,
+                    .msg = ctx.msg,
+                    .callback = ctx.cb,
+                    .result = .{ .timer = {} },
                 });
             },
 

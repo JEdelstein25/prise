@@ -28,6 +28,7 @@ pub const Loop = struct {
         recv,
         send,
         close,
+        timer,
     };
 
     pub fn init(allocator: std.mem.Allocator) !Loop {
@@ -169,6 +170,30 @@ pub const Loop = struct {
         try self.completions.append(self.allocator, .{
             .id = id,
             .result = .{ .close = {} },
+        });
+
+        return root.Task{ .id = id, .ctx = ctx };
+    }
+
+    pub fn timeout(
+        self: *Loop,
+        nanoseconds: u64,
+        ctx: root.Context,
+    ) !root.Task {
+        _ = nanoseconds; // Mock doesn't actually wait
+
+        const id = self.next_id;
+        self.next_id += 1;
+
+        try self.pending.put(id, .{
+            .ctx = ctx,
+            .kind = .timer,
+        });
+
+        // Mock immediately completes timers
+        try self.completions.append(self.allocator, .{
+            .id = id,
+            .result = .{ .timer = {} },
         });
 
         return root.Task{ .id = id, .ctx = ctx };

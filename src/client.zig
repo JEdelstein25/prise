@@ -125,6 +125,7 @@ pub const App = struct {
     send_buffer: ?[]u8 = null,
     pty_id: ?i64 = null,
     response_received: bool = false,
+    attached: bool = false,
 
     pub fn onConnected(l: *io.Loop, completion: io.Completion) anyerror!void {
         const app = completion.userdataCast(@This());
@@ -177,7 +178,7 @@ pub const App = struct {
         }
     }
 
-    fn onRecv(_: *io.Loop, completion: io.Completion) anyerror!void {
+    fn onRecv(l: *io.Loop, completion: io.Completion) anyerror!void {
         const app = completion.userdataCast(@This());
 
         switch (completion.result) {
@@ -199,12 +200,36 @@ pub const App = struct {
                         } else {
                             switch (resp.result) {
                                 .integer => |i| {
-                                    app.pty_id = i;
-                                    std.log.info("PTY spawned with ID: {}", .{i});
+                                    if (app.pty_id == null) {
+                                        app.pty_id = i;
+                                        std.log.info("PTY spawned with ID: {}", .{i});
+
+                                        // Attach to the session
+                                        app.send_buffer = try msgpack.encode(app.allocator, .{ 0, 2, "attach_pty", .{i} });
+                                        _ = try l.send(app.fd, app.send_buffer.?, .{
+                                            .ptr = app,
+                                            .cb = onSendComplete,
+                                        });
+                                    } else if (!app.attached) {
+                                        std.log.info("Attached to session {}", .{i});
+                                        app.attached = true;
+                                    }
                                 },
                                 .unsigned => |u| {
-                                    app.pty_id = @intCast(u);
-                                    std.log.info("PTY spawned with ID: {}", .{u});
+                                    if (app.pty_id == null) {
+                                        app.pty_id = @intCast(u);
+                                        std.log.info("PTY spawned with ID: {}", .{u});
+
+                                        // Attach to the session
+                                        app.send_buffer = try msgpack.encode(app.allocator, .{ 0, 2, "attach_pty", .{u} });
+                                        _ = try l.send(app.fd, app.send_buffer.?, .{
+                                            .ptr = app,
+                                            .cb = onSendComplete,
+                                        });
+                                    } else if (!app.attached) {
+                                        std.log.info("Attached to session {}", .{u});
+                                        app.attached = true;
+                                    }
                                 },
                                 .string => |s| {
                                     std.log.info("Result: {s}", .{s});
@@ -219,10 +244,19 @@ pub const App = struct {
                     .request => {
                         std.log.warn("Got unexpected request from server", .{});
                     },
-                    .notification => {
-                        std.log.info("Got notification from server", .{});
+                    .notification => |notif| {
+                        std.log.info("Got notification: method={s}", .{notif.method});
+                        if (std.mem.eql(u8, notif.method, "redraw")) {
+                            std.log.debug("Redraw notification received", .{});
+                        }
                     },
                 }
+
+                // Keep receiving
+                _ = try l.recv(app.fd, &app.recv_buffer, .{
+                    .ptr = app,
+                    .cb = onRecv,
+                });
             },
             .err => |err| {
                 std.log.err("Recv failed: {}", .{err});
