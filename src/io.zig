@@ -37,6 +37,7 @@ pub const Result = union(enum) {
     socket: posix.socket_t,
     connect: void,
     accept: posix.socket_t,
+    read: usize,
     recv: usize,
     send: usize,
     close: void,

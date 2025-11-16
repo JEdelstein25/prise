@@ -9,9 +9,9 @@ const posix = std.posix;
 const ghostty_vt = @import("ghostty-vt");
 const vt_handler = @import("vt_handler.zig");
 
-const Session = struct {
+const Pty = struct {
     id: usize,
-    pty: pty.Pty,
+    process: pty.Process,
     clients: std.ArrayList(*Client),
     read_thread: ?std.Thread = null,
     running: std.atomic.Value(bool),
@@ -21,13 +21,22 @@ const Session = struct {
 
     // Synchronization for terminal access
     terminal_mutex: std.Thread.Mutex = .{},
-    dirty: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    // Dirty signaling
+    pipe_fds: [2]posix.fd_t,
+    dirty_signal_buf: [1]u8 = undefined,
+    last_render_time: i64 = 0,
+    render_timer: ?io.Task = null,
 
-    fn init(allocator: std.mem.Allocator, id: usize, pty_instance: pty.Pty, size: pty.winsize) !*Session {
-        const session = try allocator.create(Session);
-        session.* = .{
+    // Pointer to server for callbacks (opaque to avoid circular type dependency)
+    server_ptr: *anyopaque = undefined,
+
+    fn init(allocator: std.mem.Allocator, id: usize, process_instance: pty.Process, size: pty.winsize) !*Pty {
+        const instance = try allocator.create(Pty);
+        const pipe_fds = try posix.pipe2(.{ .NONBLOCK = true, .CLOEXEC = true });
+
+        instance.* = .{
             .id = id,
-            .pty = pty_instance,
+            .process = process_instance,
             .clients = std.ArrayList(*Client).empty,
             .running = std.atomic.Value(bool).init(true),
             .terminal = try ghostty_vt.Terminal.init(allocator, .{
@@ -35,30 +44,33 @@ const Session = struct {
                 .rows = size.ws_row,
             }),
             .allocator = allocator,
+            .pipe_fds = pipe_fds,
         };
-        return session;
+        return instance;
     }
 
-    fn deinit(self: *Session, allocator: std.mem.Allocator) void {
+    fn deinit(self: *Pty, allocator: std.mem.Allocator) void {
         self.running.store(false, .seq_cst);
 
         // Kill the PTY process
-        _ = posix.kill(self.pty.pid, posix.SIG.HUP) catch {};
+        _ = posix.kill(self.process.pid, posix.SIG.HUP) catch {};
 
         if (self.read_thread) |thread| {
             thread.join();
         }
-        self.pty.close();
+        self.process.close();
+        posix.close(self.pipe_fds[0]);
+        posix.close(self.pipe_fds[1]);
         self.terminal.deinit(allocator);
         self.clients.deinit(allocator);
         allocator.destroy(self);
     }
 
-    fn addClient(self: *Session, allocator: std.mem.Allocator, client: *Client) !void {
+    fn addClient(self: *Pty, allocator: std.mem.Allocator, client: *Client) !void {
         try self.clients.append(allocator, client);
     }
 
-    fn removeClient(self: *Session, client: *Client) void {
+    fn removeClient(self: *Pty, client: *Client) void {
         for (self.clients.items, 0..) |c, i| {
             if (c == client) {
                 _ = self.clients.swapRemove(i);
@@ -69,7 +81,7 @@ const Session = struct {
 
     // Removed broadcast - we'll send msgpack-RPC redraw notifications instead
 
-    fn readThread(self: *Session, server: *Server) void {
+    fn readThread(self: *Pty, server: *Server) void {
         _ = server;
         var buffer: [4096]u8 = undefined;
 
@@ -79,8 +91,8 @@ const Session = struct {
         // Set up the write callback so the handler can respond to queries
         handler.setWriteCallback(self, struct {
             fn writeToPty(ctx: ?*anyopaque, data: []const u8) !void {
-                const session: *Session = @ptrCast(@alignCast(ctx));
-                _ = posix.write(session.pty.master, data) catch |err| {
+                const pty_inst: *Pty = @ptrCast(@alignCast(ctx));
+                _ = posix.write(pty_inst.process.master, data) catch |err| {
                     std.log.err("Failed to write to PTY: {}", .{err});
                     return err;
                 };
@@ -91,7 +103,7 @@ const Session = struct {
         defer stream.deinit();
 
         while (self.running.load(.seq_cst)) {
-            const n = posix.read(self.pty.master, &buffer) catch |err| {
+            const n = posix.read(self.process.master, &buffer) catch |err| {
                 if (err == error.WouldBlock) {
                     std.Thread.sleep(10 * std.time.ns_per_ms);
                     continue;
@@ -111,14 +123,19 @@ const Session = struct {
                 continue;
             };
 
-            // Mark as dirty so main thread will send redraw
-            self.dirty.store(true, .release);
+            // Notify main thread by writing to pipe
+            // Ignore EAGAIN (pipe full means already dirty)
+            _ = posix.write(self.pipe_fds[1], "x") catch |err| {
+                if (err != error.WouldBlock) {
+                    std.log.err("Failed to signal dirty: {}", .{err});
+                }
+            };
         }
         std.log.info("PTY read thread exiting for session {}", .{self.id});
 
         // Reap the child process
-        const result = posix.waitpid(self.pty.pid, 0);
-        std.log.info("Session {} PTY process {} exited with status {}", .{ self.id, self.pty.pid, result.status });
+        const result = posix.waitpid(self.process.pid, 0);
+        std.log.info("Session {} PTY process {} exited with status {}", .{ self.id, self.process.pid, result.status });
     }
 };
 
@@ -335,8 +352,8 @@ const Client = struct {
                             return;
                         };
 
-                        if (self.server.sessions.get(session_id)) |session| {
-                            _ = posix.write(session.pty.master, input_data) catch |err| {
+                        if (self.server.ptys.get(session_id)) |pty_instance| {
+                            _ = posix.write(pty_instance.process.master, input_data) catch |err| {
                                 std.log.err("Write to PTY failed: {}", .{err});
                             };
                         } else {
@@ -364,7 +381,7 @@ const Client = struct {
 
                         std.log.debug("Received key_input: session={} notation='{s}'", .{ session_id, notation });
 
-                        if (self.server.sessions.get(session_id)) |session| {
+                        if (self.server.ptys.get(session_id)) |pty_instance| {
                             // Parse Neovim key notation to ghostty key
                             const key = key_parse.parseKeyNotation(notation) catch |err| {
                                 std.log.err("Failed to parse key notation '{s}': {}", .{ notation, err });
@@ -383,19 +400,19 @@ const Client = struct {
                             var stream = std.io.fixedBufferStream(&encode_buf);
                             const writer = stream.writer();
 
-                            session.terminal_mutex.lock();
-                            key_encode.encode(writer, key, &session.terminal) catch |err| {
+                            pty_instance.terminal_mutex.lock();
+                            key_encode.encode(writer, key, &pty_instance.terminal) catch |err| {
                                 std.log.err("Failed to encode key: {}", .{err});
-                                session.terminal_mutex.unlock();
+                                pty_instance.terminal_mutex.unlock();
                                 return;
                             };
-                            session.terminal_mutex.unlock();
+                            pty_instance.terminal_mutex.unlock();
 
                             const encoded = stream.getWritten();
                             std.log.debug("Encoded key to {} bytes: {any}", .{ encoded.len, encoded });
 
                             if (encoded.len > 0) {
-                                _ = posix.write(session.pty.master, encoded) catch |err| {
+                                _ = posix.write(pty_instance.process.master, encoded) catch |err| {
                                     std.log.err("Write to PTY failed: {}", .{err});
                                 };
                             }
@@ -432,31 +449,28 @@ const Client = struct {
                             },
                         };
 
-                        if (self.server.sessions.get(session_id)) |session| {
+                        if (self.server.ptys.get(session_id)) |pty_instance| {
                             const size: pty.winsize = .{
                                 .ws_row = rows,
                                 .ws_col = cols,
                                 .ws_xpixel = 0,
                                 .ws_ypixel = 0,
                             };
-                            var pty_mut = session.pty;
+                            var pty_mut = pty_instance.process;
                             pty_mut.setSize(size) catch |err| {
                                 std.log.err("Resize PTY failed: {}", .{err});
                             };
 
                             // Also resize the terminal state
-                            session.terminal_mutex.lock();
-                            session.terminal.resize(
-                                session.allocator,
+                            pty_instance.terminal_mutex.lock();
+                            pty_instance.terminal.resize(
+                                pty_instance.allocator,
                                 cols,
                                 rows,
                             ) catch |err| {
                                 std.log.err("Resize terminal failed: {}", .{err});
                             };
-                            session.terminal_mutex.unlock();
-
-                            // Mark as dirty to trigger redraw with new size
-                            session.dirty.store(true, .release);
+                            pty_instance.terminal_mutex.unlock();
 
                             std.log.info("Resized session {} to {}x{}", .{ session_id, rows, cols });
                         } else {
@@ -509,11 +523,10 @@ const Server = struct {
     listen_fd: posix.fd_t,
     socket_path: []const u8,
     clients: std.ArrayList(*Client),
-    sessions: std.AutoHashMap(usize, *Session),
+    ptys: std.AutoHashMap(usize, *Pty),
     next_session_id: usize = 0,
     accepting: bool = true,
     accept_task: ?io.Task = null,
-    frame_timer: ?io.Task = null,
 
     fn handleRequest(self: *Server, client: *Client, method: []const u8, params: msgpack.Value) !msgpack.Value {
         if (std.mem.eql(u8, method, "ping")) {
@@ -533,17 +546,25 @@ const Server = struct {
             };
 
             const shell = std.posix.getenv("SHELL") orelse "/bin/sh";
-            const pty_instance = try pty.Pty.spawn(self.allocator, size, &.{shell}, null);
+            const process = try pty.Process.spawn(self.allocator, size, &.{shell}, null);
 
             const session_id = self.next_session_id;
             self.next_session_id += 1;
 
-            const session = try Session.init(self.allocator, session_id, pty_instance, size);
-            try self.sessions.put(session_id, session);
+            const pty_instance = try Pty.init(self.allocator, session_id, process, size);
+            pty_instance.server_ptr = self;
 
-            session.read_thread = try std.Thread.spawn(.{}, Session.readThread, .{ session, self });
+            try self.ptys.put(session_id, pty_instance);
 
-            std.log.info("Created session {} with PID {}", .{ session_id, pty_instance.pid });
+            pty_instance.read_thread = try std.Thread.spawn(.{}, Pty.readThread, .{ pty_instance, self });
+
+            // Register dirty signal pipe
+            _ = try self.loop.read(pty_instance.pipe_fds[0], &pty_instance.dirty_signal_buf, .{
+                .ptr = pty_instance,
+                .cb = onPtyDirty,
+            });
+
+            std.log.info("Created session {} with PID {}", .{ session_id, process.pid });
 
             return msgpack.Value{ .unsigned = session_id };
         } else if (std.mem.eql(u8, method, "attach_pty")) {
@@ -556,12 +577,12 @@ const Server = struct {
 
             std.log.info("attach_pty: session_id={} client_fd={}", .{ session_id, client.fd });
 
-            const session = self.sessions.get(session_id) orelse {
+            const pty_instance = self.ptys.get(session_id) orelse {
                 std.log.warn("attach_pty: session {} not found", .{session_id});
                 return msgpack.Value{ .string = try self.allocator.dupe(u8, "session not found") };
             };
 
-            try session.addClient(self.allocator, client);
+            try pty_instance.addClient(self.allocator, client);
             try client.attached_sessions.append(self.allocator, session_id);
             std.log.info("Client {} attached to session {}", .{ client.fd, session_id });
 
@@ -573,11 +594,11 @@ const Server = struct {
             const session_id: usize = @intCast(params.array[0].unsigned);
             const data = params.array[1].binary;
 
-            const session = self.sessions.get(session_id) orelse {
+            const pty_instance = self.ptys.get(session_id) orelse {
                 return msgpack.Value{ .string = try self.allocator.dupe(u8, "session not found") };
             };
 
-            _ = posix.write(session.pty.master, data) catch |err| {
+            _ = posix.write(pty_instance.process.master, data) catch |err| {
                 std.log.err("Write to PTY failed: {}", .{err});
                 return msgpack.Value{ .string = try self.allocator.dupe(u8, "write failed") };
             };
@@ -591,7 +612,7 @@ const Server = struct {
             const rows: u16 = @intCast(params.array[1].unsigned);
             const cols: u16 = @intCast(params.array[2].unsigned);
 
-            const session = self.sessions.get(session_id) orelse {
+            const pty_instance = self.ptys.get(session_id) orelse {
                 return msgpack.Value{ .string = try self.allocator.dupe(u8, "session not found") };
             };
 
@@ -602,11 +623,22 @@ const Server = struct {
                 .ws_ypixel = 0,
             };
 
-            var pty_mut = session.pty;
+            var pty_mut = pty_instance.process;
             pty_mut.setSize(size) catch |err| {
                 std.log.err("Resize PTY failed: {}", .{err});
                 return msgpack.Value{ .string = try self.allocator.dupe(u8, "resize failed") };
             };
+
+            // Also resize the terminal state
+            pty_instance.terminal_mutex.lock();
+            pty_instance.terminal.resize(
+                pty_instance.allocator,
+                cols,
+                rows,
+            ) catch |err| {
+                std.log.err("Resize terminal failed: {}", .{err});
+            };
+            pty_instance.terminal_mutex.unlock();
 
             std.log.info("Resized session {} to {}x{}", .{ session_id, rows, cols });
             return msgpack.Value.nil;
@@ -617,17 +649,17 @@ const Server = struct {
             const session_id: usize = @intCast(params.array[0].unsigned);
             const client_fd: posix.fd_t = @intCast(params.array[1].unsigned);
 
-            const session = self.sessions.get(session_id) orelse {
+            const pty_instance = self.ptys.get(session_id) orelse {
                 return msgpack.Value{ .string = try self.allocator.dupe(u8, "session not found") };
             };
 
             // Mark session as keep_alive since client explicitly detached
-            session.keep_alive = true;
+            pty_instance.keep_alive = true;
 
             // Find client by fd and detach
             for (self.clients.items) |c| {
                 if (c.fd == client_fd) {
-                    session.removeClient(c);
+                    pty_instance.removeClient(c);
                     for (c.attached_sessions.items, 0..) |sid, i| {
                         if (sid == session_id) {
                             _ = c.attached_sessions.swapRemove(i);
@@ -646,7 +678,7 @@ const Server = struct {
     }
 
     fn shouldExit(self: *Server) bool {
-        return self.clients.items.len == 0 and self.sessions.count() == 0;
+        return self.clients.items.len == 0 and self.ptys.count() == 0;
     }
 
     fn cleanupSessionsForClient(self: *Server, client: *Client) void {
@@ -654,28 +686,28 @@ const Server = struct {
         defer to_remove.deinit(self.allocator);
 
         for (client.attached_sessions.items) |session_id| {
-            if (self.sessions.get(session_id)) |session| {
-                session.removeClient(client);
+            if (self.ptys.get(session_id)) |pty_instance| {
+                pty_instance.removeClient(client);
                 std.log.info("Auto-removed client {} from session {}", .{ client.fd, session_id });
 
                 // If no more clients attached and not marked keep_alive, kill the session
-                if (session.clients.items.len == 0 and !session.keep_alive) {
+                if (pty_instance.clients.items.len == 0 and !pty_instance.keep_alive) {
                     to_remove.append(self.allocator, session_id) catch {};
                 }
             }
         }
 
         // Also cleanup any orphaned sessions with no clients and not keep_alive
-        var it = self.sessions.iterator();
+        var it = self.ptys.iterator();
         while (it.next()) |entry| {
-            const session = entry.value_ptr.*;
-            if (session.clients.items.len == 0 and !session.keep_alive) {
-                to_remove.append(self.allocator, session.id) catch {};
+            const pty_instance = entry.value_ptr.*;
+            if (pty_instance.clients.items.len == 0 and !pty_instance.keep_alive) {
+                to_remove.append(self.allocator, pty_instance.id) catch {};
             }
         }
 
         for (to_remove.items) |session_id| {
-            if (self.sessions.fetchRemove(session_id)) |kv| {
+            if (self.ptys.fetchRemove(session_id)) |kv| {
                 std.log.info("Killing session {} (no clients, not keep_alive)", .{session_id});
                 kv.value.deinit(self.allocator);
             }
@@ -816,23 +848,23 @@ const Server = struct {
     }
 
     /// Build and send redraw notification for a session to all attached clients
-    fn sendRedraw(self: *Server, loop: *io.Loop, session: *Session, state: *ScreenState) !void {
+    fn sendRedraw(self: *Server, loop: *io.Loop, pty_instance: *Pty, state: *ScreenState) !void {
         const redraw = @import("redraw.zig");
 
-        std.log.debug("sendRedraw: session {} has {} total clients", .{ session.id, self.clients.items.len });
+        std.log.debug("sendRedraw: session {} has {} total clients", .{ pty_instance.id, self.clients.items.len });
 
         // Send to each client attached to this session
         for (self.clients.items) |client| {
             // Check if client is attached to this session
             var attached = false;
             for (client.attached_sessions.items) |sid| {
-                if (sid == session.id) {
+                if (sid == pty_instance.id) {
                     attached = true;
                     break;
                 }
             }
             if (!attached) {
-                std.log.debug("Client {} not attached to session {}", .{ client.fd, session.id });
+                std.log.debug("Client {} not attached to session {}", .{ client.fd, pty_instance.id });
                 continue;
             }
 
@@ -858,9 +890,9 @@ const Server = struct {
 
             // Define new styles
             for (styles_to_define.items) |style_id| {
-                session.terminal_mutex.lock();
-                const attrs = try convertStyle(self.allocator, &session.terminal, style_id);
-                session.terminal_mutex.unlock();
+                pty_instance.terminal_mutex.lock();
+                const attrs = try convertStyle(self.allocator, &pty_instance.terminal, style_id);
+                pty_instance.terminal_mutex.unlock();
 
                 try builder.hlAttrDefine(style_id, attrs, attrs);
             }
@@ -925,54 +957,77 @@ const Server = struct {
         }
     }
 
-    fn onFrameTimer(loop: *io.Loop, completion: io.Completion) anyerror!void {
-        const self = completion.userdataCast(Server);
+    fn renderFrame(self: *Server, pty_instance: *Pty) void {
+        // Copy screen state under mutex
+        var state = ScreenState.init(
+            self.allocator,
+            &pty_instance.terminal,
+            &pty_instance.terminal_mutex,
+        ) catch |err| {
+            std.log.err("Failed to copy screen state for session {}: {}", .{ pty_instance.id, err });
+            return;
+        };
+        defer state.deinit();
+
+        // Build and send redraw notifications
+        self.sendRedraw(self.loop, pty_instance, &state) catch |err| {
+            std.log.err("Failed to send redraw for session {}: {}", .{ pty_instance.id, err });
+        };
+
+        // Update timestamp
+        pty_instance.last_render_time = std.time.milliTimestamp();
+    }
+
+    fn onRenderTimer(loop: *io.Loop, completion: io.Completion) anyerror!void {
+        _ = loop;
+        const pty_instance = completion.userdataCast(Pty);
+        const server: *Server = @ptrCast(@alignCast(pty_instance.server_ptr));
+        server.renderFrame(pty_instance);
+        pty_instance.render_timer = null;
+    }
+
+    fn onPtyDirty(loop: *io.Loop, completion: io.Completion) anyerror!void {
+        const pty_instance = completion.userdataCast(Pty);
+        const server: *Server = @ptrCast(@alignCast(pty_instance.server_ptr));
 
         switch (completion.result) {
-            .timer => {
-                // Process each dirty session
-                var it = self.sessions.iterator();
-                while (it.next()) |entry| {
-                    const session = entry.value_ptr.*;
+            .read => |n| {
+                if (n == 0) return;
 
-                    // Check if dirty (atomic load)
-                    if (!session.dirty.load(.acquire)) continue;
-
-                    std.log.debug("Session {} is dirty, sending redraw", .{session.id});
-
-                    // Copy screen state under mutex
-                    var state = ScreenState.init(
-                        self.allocator,
-                        &session.terminal,
-                        &session.terminal_mutex,
-                    ) catch |err| {
-                        std.log.err("Failed to copy screen state for session {}: {}", .{ session.id, err });
-                        session.dirty.store(false, .release);
-                        continue;
-                    };
-                    defer state.deinit();
-
-                    // Clear dirty flag now that we've captured the state
-                    session.dirty.store(false, .release);
-
-                    // Build and send redraw notifications
-                    self.sendRedraw(loop, session, &state) catch |err| {
-                        std.log.err("Failed to send redraw for session {}: {}", .{ session.id, err });
+                // Drain pipe
+                var buf: [128]u8 = undefined;
+                while (true) {
+                    _ = posix.read(pty_instance.pipe_fds[0], &buf) catch |err| {
+                        if (err == error.WouldBlock) break;
+                        break;
                     };
                 }
 
-                // Re-schedule frame timer (8ms = ~120 FPS)
-                if (self.accepting or self.sessions.count() > 0) {
-                    self.frame_timer = try loop.timeout(8 * std.time.ns_per_ms, .{
-                        .ptr = self,
-                        .cb = onFrameTimer,
+                const now = std.time.milliTimestamp();
+                const FRAME_TIME = 8;
+
+                if (now - pty_instance.last_render_time >= FRAME_TIME) {
+                    server.renderFrame(pty_instance);
+                } else if (pty_instance.render_timer == null) {
+                    const delay = FRAME_TIME - (now - pty_instance.last_render_time);
+                    // Make sure delay is positive
+                    const safe_delay = if (delay < 0) 0 else delay;
+                    pty_instance.render_timer = try loop.timeout(@as(u64, @intCast(safe_delay)) * std.time.ns_per_ms, .{
+                        .ptr = pty_instance,
+                        .cb = onRenderTimer,
                     });
                 }
+
+                // Re-arm
+                _ = try loop.read(pty_instance.pipe_fds[0], &pty_instance.dirty_signal_buf, .{
+                    .ptr = pty_instance,
+                    .cb = onPtyDirty,
+                });
             },
             .err => |err| {
-                std.log.err("Frame timer error: {}", .{err});
+                std.log.err("Pty dirty pipe error: {}", .{err});
             },
-            else => unreachable,
+            else => {},
         }
     }
 };
@@ -1004,7 +1059,7 @@ pub fn startServer(allocator: std.mem.Allocator, socket_path: []const u8) !void 
         .listen_fd = listen_fd,
         .socket_path = socket_path,
         .clients = std.ArrayList(*Client).empty,
-        .sessions = std.AutoHashMap(usize, *Session).init(allocator),
+        .ptys = std.AutoHashMap(usize, *Pty).init(allocator),
     };
     defer {
         for (server.clients.items) |client| {
@@ -1014,23 +1069,17 @@ pub fn startServer(allocator: std.mem.Allocator, socket_path: []const u8) !void 
             allocator.destroy(client);
         }
         server.clients.deinit(allocator);
-        var it = server.sessions.valueIterator();
-        while (it.next()) |session| {
-            session.*.deinit(allocator);
+        var it = server.ptys.valueIterator();
+        while (it.next()) |pty_instance| {
+            pty_instance.*.deinit(allocator);
         }
-        server.sessions.deinit();
+        server.ptys.deinit();
     }
 
     // Start accepting connections
     server.accept_task = try loop.accept(listen_fd, .{
         .ptr = &server,
         .cb = Server.onAccept,
-    });
-
-    // Start frame timer (8ms = ~120 FPS)
-    server.frame_timer = try loop.timeout(8 * std.time.ns_per_ms, .{
-        .ptr = &server,
-        .cb = Server.onFrameTimer,
     });
 
     // Run until server decides to exit
@@ -1053,10 +1102,10 @@ test "server lifecycle - shutdown when no clients" {
         .listen_fd = 100,
         .socket_path = "/tmp/test.sock",
         .clients = std.ArrayList(*Client).empty,
-        .sessions = std.AutoHashMap(usize, *Session).init(testing.allocator),
+        .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
     };
     defer server.clients.deinit(testing.allocator);
-    defer server.sessions.deinit();
+    defer server.ptys.deinit();
 
     server.accept_task = try loop.accept(100, .{
         .ptr = &server,
@@ -1084,14 +1133,14 @@ test "server lifecycle - accept client connection" {
         .listen_fd = 100,
         .socket_path = "/tmp/test.sock",
         .clients = std.ArrayList(*Client).empty,
-        .sessions = std.AutoHashMap(usize, *Session).init(testing.allocator),
+        .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
     };
     defer {
         for (server.clients.items) |client| {
             testing.allocator.destroy(client);
         }
         server.clients.deinit(testing.allocator);
-        server.sessions.deinit();
+        server.ptys.deinit();
     }
 
     server.accept_task = try loop.accept(100, .{
@@ -1118,14 +1167,14 @@ test "server lifecycle - client disconnect triggers shutdown" {
         .listen_fd = 100,
         .socket_path = "/tmp/test.sock",
         .clients = std.ArrayList(*Client).empty,
-        .sessions = std.AutoHashMap(usize, *Session).init(testing.allocator),
+        .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
     };
     defer {
         for (server.clients.items) |client| {
             testing.allocator.destroy(client);
         }
         server.clients.deinit(testing.allocator);
-        server.sessions.deinit();
+        server.ptys.deinit();
     }
 
     server.accept_task = try loop.accept(100, .{
@@ -1158,14 +1207,14 @@ test "server lifecycle - multiple clients" {
         .listen_fd = 100,
         .socket_path = "/tmp/test.sock",
         .clients = std.ArrayList(*Client).empty,
-        .sessions = std.AutoHashMap(usize, *Session).init(testing.allocator),
+        .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
     };
     defer {
         for (server.clients.items) |client| {
             testing.allocator.destroy(client);
         }
         server.clients.deinit(testing.allocator);
-        server.sessions.deinit();
+        server.ptys.deinit();
     }
 
     server.accept_task = try loop.accept(100, .{
@@ -1215,14 +1264,14 @@ test "server lifecycle - recv error triggers disconnect" {
         .listen_fd = 100,
         .socket_path = "/tmp/test.sock",
         .clients = std.ArrayList(*Client).empty,
-        .sessions = std.AutoHashMap(usize, *Session).init(testing.allocator),
+        .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
     };
     defer {
         for (server.clients.items) |client| {
             testing.allocator.destroy(client);
         }
         server.clients.deinit(testing.allocator);
-        server.sessions.deinit();
+        server.ptys.deinit();
     }
 
     server.accept_task = try loop.accept(100, .{

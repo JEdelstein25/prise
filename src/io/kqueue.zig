@@ -22,6 +22,7 @@ pub const Loop = struct {
         socket,
         connect,
         accept,
+        read,
         recv,
         send,
         close,
@@ -146,6 +147,35 @@ pub const Loop = struct {
             .ctx = ctx,
             .kind = .accept,
             .fd = fd,
+        });
+
+        var changes = [_]posix.Kevent{.{
+            .ident = @intCast(fd),
+            .filter = c.EVFILT.READ,
+            .flags = c.EV.ADD | c.EV.ENABLE | c.EV.ONESHOT,
+            .fflags = 0,
+            .data = 0,
+            .udata = id,
+        }};
+        _ = try posix.kevent(self.kq, &changes, &[_]posix.Kevent{}, null);
+
+        return root.Task{ .id = id, .ctx = ctx };
+    }
+
+    pub fn read(
+        self: *Loop,
+        fd: posix.socket_t,
+        buf: []u8,
+        ctx: root.Context,
+    ) !root.Task {
+        const id = self.next_id;
+        self.next_id += 1;
+
+        try self.pending.put(id, .{
+            .ctx = ctx,
+            .kind = .read,
+            .fd = fd,
+            .buf = buf,
         });
 
         var changes = [_]posix.Kevent{.{
@@ -351,6 +381,25 @@ pub const Loop = struct {
                     .msg = ctx.msg,
                     .callback = ctx.cb,
                     .result = .{ .accept = client_fd },
+                });
+            },
+
+            .read => {
+                const bytes_read = posix.read(op.fd, op.buf) catch |err| {
+                    try ctx.cb(self, .{
+                        .userdata = ctx.ptr,
+                        .msg = ctx.msg,
+                        .callback = ctx.cb,
+                        .result = .{ .err = err },
+                    });
+                    return;
+                };
+
+                try ctx.cb(self, .{
+                    .userdata = ctx.ptr,
+                    .msg = ctx.msg,
+                    .callback = ctx.cb,
+                    .result = .{ .read = bytes_read },
                 });
             },
 

@@ -22,7 +22,7 @@ const TIOCSWINSZ = if (builtin.os.tag == .macos) 2148037735 else c.TIOCSWINSZ;
 
 pub const winsize = c.winsize;
 
-pub const Pty = struct {
+pub const Process = struct {
     master: posix.fd_t,
     slave: posix.fd_t,
     pid: posix.pid_t,
@@ -41,7 +41,7 @@ pub const Pty = struct {
         size: winsize,
         argv: []const []const u8,
         env: ?[]const []const u8,
-    ) OpenError!Pty {
+    ) OpenError!Process {
         var master_fd: c_int = undefined;
         var slave_fd: c_int = undefined;
 
@@ -174,13 +174,13 @@ pub const Pty = struct {
         }
     }
 
-    pub fn setSize(self: *Pty, size: winsize) !void {
+    pub fn setSize(self: *Process, size: winsize) !void {
         if (c.ioctl(self.master, TIOCSWINSZ, @intFromPtr(&size)) < 0) {
             return error.IoctlFailed;
         }
     }
 
-    pub fn close(self: *Pty) void {
+    pub fn close(self: *Process) void {
         if (self.master != -1) posix.close(self.master);
         if (self.slave != -1) posix.close(self.slave);
     }

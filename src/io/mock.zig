@@ -25,6 +25,7 @@ pub const Loop = struct {
         socket,
         connect,
         accept,
+        read,
         recv,
         send,
         close,
@@ -109,6 +110,25 @@ pub const Loop = struct {
             .ctx = ctx,
             .kind = .accept,
             .fd = fd,
+        });
+
+        return root.Task{ .id = id, .ctx = ctx };
+    }
+
+    pub fn read(
+        self: *Loop,
+        fd: posix.socket_t,
+        buf: []u8,
+        ctx: root.Context,
+    ) !root.Task {
+        const id = self.next_id;
+        self.next_id += 1;
+
+        try self.pending.put(id, .{
+            .ctx = ctx,
+            .kind = .read,
+            .fd = fd,
+            .buf = buf,
         });
 
         return root.Task{ .id = id, .ctx = ctx };
@@ -256,6 +276,23 @@ pub const Loop = struct {
                 try self.completions.append(self.allocator, .{
                     .id = entry.key_ptr.*,
                     .result = .{ .accept = client_fd },
+                });
+                return;
+            }
+        }
+        return error.OperationNotFound;
+    }
+
+    pub fn completeRead(self: *Loop, fd: posix.socket_t, data: []const u8) !void {
+        var it = self.pending.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.kind == .read and entry.value_ptr.fd == fd) {
+                const buf = entry.value_ptr.buf;
+                const n = @min(buf.len, data.len);
+                @memcpy(buf[0..n], data[0..n]);
+                try self.completions.append(self.allocator, .{
+                    .id = entry.key_ptr.*,
+                    .result = .{ .read = n },
                 });
                 return;
             }
