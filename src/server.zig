@@ -3,6 +3,8 @@ const io = @import("io.zig");
 const rpc = @import("rpc.zig");
 const msgpack = @import("msgpack.zig");
 const pty = @import("pty.zig");
+const key_parse = @import("key_parse.zig");
+const key_encode = @import("key_encode.zig");
 const posix = std.posix;
 const ghostty_vt = @import("ghostty-vt");
 const vt_handler = @import("vt_handler.zig");
@@ -313,8 +315,157 @@ const Client = struct {
                 });
             },
             .notification => |notif| {
-                _ = notif;
-                // std.log.info("Got notification: method={s}", .{notif.method});
+                // Handle notifications (no response needed)
+                if (std.mem.eql(u8, notif.method, "write_pty")) {
+                    if (notif.params == .array and notif.params.array.len >= 2) {
+                        const session_id: usize = switch (notif.params.array[0]) {
+                            .unsigned => |u| @intCast(u),
+                            .integer => |i| @intCast(i),
+                            else => {
+                                std.log.warn("write_pty notification: invalid session_id type", .{});
+                                return;
+                            },
+                        };
+                        const input_data = if (notif.params.array[1] == .binary)
+                            notif.params.array[1].binary
+                        else if (notif.params.array[1] == .string)
+                            notif.params.array[1].string
+                        else {
+                            std.log.warn("write_pty notification: invalid data type", .{});
+                            return;
+                        };
+
+                        if (self.server.sessions.get(session_id)) |session| {
+                            _ = posix.write(session.pty.master, input_data) catch |err| {
+                                std.log.err("Write to PTY failed: {}", .{err});
+                            };
+                        } else {
+                            std.log.warn("write_pty notification: session {} not found", .{session_id});
+                        }
+                    } else {
+                        std.log.warn("write_pty notification: invalid params", .{});
+                    }
+                } else if (std.mem.eql(u8, notif.method, "key_input")) {
+                    if (notif.params == .array and notif.params.array.len >= 2) {
+                        const session_id: usize = switch (notif.params.array[0]) {
+                            .unsigned => |u| @intCast(u),
+                            .integer => |i| @intCast(i),
+                            else => {
+                                std.log.warn("key_input notification: invalid session_id type", .{});
+                                return;
+                            },
+                        };
+                        const notation = if (notif.params.array[1] == .string)
+                            notif.params.array[1].string
+                        else {
+                            std.log.warn("key_input notification: invalid notation type", .{});
+                            return;
+                        };
+
+                        std.log.debug("Received key_input: session={} notation='{s}'", .{ session_id, notation });
+
+                        if (self.server.sessions.get(session_id)) |session| {
+                            // Parse Neovim key notation to ghostty key
+                            const key = key_parse.parseKeyNotation(notation) catch |err| {
+                                std.log.err("Failed to parse key notation '{s}': {}", .{ notation, err });
+                                return;
+                            };
+
+                            std.log.debug("Parsed key: key={} mods=(shift={} ctrl={} alt={})", .{
+                                key.key,
+                                key.mods.shift,
+                                key.mods.ctrl,
+                                key.mods.alt,
+                            });
+
+                            // Encode key using terminal state
+                            var encode_buf: [32]u8 = undefined;
+                            var stream = std.io.fixedBufferStream(&encode_buf);
+                            const writer = stream.writer();
+
+                            session.terminal_mutex.lock();
+                            key_encode.encode(writer, key, &session.terminal) catch |err| {
+                                std.log.err("Failed to encode key: {}", .{err});
+                                session.terminal_mutex.unlock();
+                                return;
+                            };
+                            session.terminal_mutex.unlock();
+
+                            const encoded = stream.getWritten();
+                            std.log.debug("Encoded key to {} bytes: {any}", .{ encoded.len, encoded });
+
+                            if (encoded.len > 0) {
+                                _ = posix.write(session.pty.master, encoded) catch |err| {
+                                    std.log.err("Write to PTY failed: {}", .{err});
+                                };
+                            }
+                        } else {
+                            std.log.warn("key_input notification: session {} not found", .{session_id});
+                        }
+                    } else {
+                        std.log.warn("key_input notification: invalid params", .{});
+                    }
+                } else if (std.mem.eql(u8, notif.method, "resize_pty")) {
+                    if (notif.params == .array and notif.params.array.len >= 3) {
+                        const session_id: usize = switch (notif.params.array[0]) {
+                            .unsigned => |u| @intCast(u),
+                            .integer => |i| @intCast(i),
+                            else => {
+                                std.log.warn("resize_pty notification: invalid session_id type", .{});
+                                return;
+                            },
+                        };
+                        const rows: u16 = switch (notif.params.array[1]) {
+                            .unsigned => |u| @intCast(u),
+                            .integer => |i| @intCast(i),
+                            else => {
+                                std.log.warn("resize_pty notification: invalid rows type", .{});
+                                return;
+                            },
+                        };
+                        const cols: u16 = switch (notif.params.array[2]) {
+                            .unsigned => |u| @intCast(u),
+                            .integer => |i| @intCast(i),
+                            else => {
+                                std.log.warn("resize_pty notification: invalid cols type", .{});
+                                return;
+                            },
+                        };
+
+                        if (self.server.sessions.get(session_id)) |session| {
+                            const size: pty.winsize = .{
+                                .ws_row = rows,
+                                .ws_col = cols,
+                                .ws_xpixel = 0,
+                                .ws_ypixel = 0,
+                            };
+                            var pty_mut = session.pty;
+                            pty_mut.setSize(size) catch |err| {
+                                std.log.err("Resize PTY failed: {}", .{err});
+                            };
+
+                            // Also resize the terminal state
+                            session.terminal_mutex.lock();
+                            session.terminal.resize(
+                                session.allocator,
+                                cols,
+                                rows,
+                            ) catch |err| {
+                                std.log.err("Resize terminal failed: {}", .{err});
+                            };
+                            session.terminal_mutex.unlock();
+
+                            // Mark as dirty to trigger redraw with new size
+                            session.dirty.store(true, .release);
+
+                            std.log.info("Resized session {} to {}x{}", .{ session_id, rows, cols });
+                        } else {
+                            std.log.warn("resize_pty notification: session {} not found", .{session_id});
+                        }
+                    } else {
+                        std.log.warn("resize_pty notification: invalid params", .{});
+                    }
+                }
             },
             .response => {
                 // std.log.warn("Client sent response, ignoring", .{});

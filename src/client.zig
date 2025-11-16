@@ -3,6 +3,7 @@ const io = @import("io.zig");
 const rpc = @import("rpc.zig");
 const msgpack = @import("msgpack.zig");
 const redraw = @import("redraw.zig");
+const key_notation = @import("key_notation.zig");
 const posix = std.posix;
 const vaxis = @import("vaxis");
 
@@ -125,14 +126,18 @@ pub const App = struct {
     allocator: std.mem.Allocator,
     recv_buffer: [4096]u8 = undefined,
     send_buffer: ?[]u8 = null,
+    input_send_buffer: ?[]u8 = null,
     pty_id: ?i64 = null,
     response_received: bool = false,
     attached: bool = false,
     vx: vaxis.Vaxis = undefined,
     tty: vaxis.Tty = undefined,
-    tty_buffer: [4096]u8 = undefined,
+    loop: vaxis.Loop(vaxis.Event) = undefined,
     should_quit: bool = false,
     hl_attrs: std.AutoHashMap(u32, vaxis.Style) = undefined,
+    event_thread: ?std.Thread = null,
+    io_loop: ?*io.Loop = null,
+    tty_buffer: [4096]u8 = undefined,
 
     pub fn init(allocator: std.mem.Allocator) !App {
         var app: App = .{
@@ -140,32 +145,67 @@ pub const App = struct {
             .vx = try vaxis.init(allocator, .{}),
             .tty = undefined,
             .tty_buffer = undefined,
+            .loop = undefined,
             .hl_attrs = std.AutoHashMap(u32, vaxis.Style).init(allocator),
         };
         app.tty = try vaxis.Tty.init(&app.tty_buffer);
+        app.loop = .{ .tty = &app.tty, .vaxis = &app.vx };
+        try app.loop.init();
+        std.log.info("Vaxis loop initialized", .{});
         return app;
     }
 
     pub fn deinit(self: *App) void {
+        self.should_quit = true;
+        self.loop.stop();
+        if (self.event_thread) |thread| {
+            thread.join();
+        }
+        if (self.input_send_buffer) |buf| {
+            self.allocator.free(buf);
+        }
         self.hl_attrs.deinit();
         self.vx.deinit(self.allocator, self.tty.writer());
         self.tty.deinit();
     }
 
     pub fn setup(self: *App, loop: *io.Loop) !void {
-        _ = loop;
-        const winsize = try vaxis.Tty.getWinsize(self.tty.fd);
-        try self.vx.resize(self.allocator, self.tty.writer(), winsize);
+        self.io_loop = loop;
 
         try self.vx.enterAltScreen(self.tty.writer());
         try self.vx.queryTerminal(self.tty.writer(), 1 * std.time.ns_per_s);
-        try self.tty.writer().flush();
 
         // Show cursor at 0,0 initially
         const win = self.vx.window();
         win.showCursor(0, 0);
 
         try self.render();
+
+        // Spawn thread to handle vaxis events
+        std.log.info("Spawning event thread...", .{});
+        self.event_thread = try std.Thread.spawn(.{}, eventThreadFn, .{self});
+        std.log.info("Event thread spawned", .{});
+    }
+
+    fn eventThreadFn(self: *App) void {
+        std.log.info("Event thread started", .{});
+
+        // Start the vaxis loop (spawns TTY reader thread)
+        self.loop.start() catch |err| {
+            std.log.err("Failed to start vaxis loop: {}", .{err});
+            return;
+        };
+        std.log.info("Vaxis loop started in event thread", .{});
+
+        while (!self.should_quit) {
+            std.log.debug("Waiting for next event...", .{});
+            const event = self.loop.nextEvent();
+            std.log.info("Received vaxis event: {s}", .{@tagName(event)});
+            self.processEvent(event) catch |err| {
+                std.log.err("Error processing event: {}", .{err});
+            };
+        }
+        std.log.info("Event thread exiting", .{});
     }
 
     pub fn handleRedraw(self: *App, params: msgpack.Value) !void {
@@ -182,7 +222,29 @@ pub const App = struct {
             const event_params = event_val.array[1];
             if (event_params != .array) continue;
 
-            if (std.mem.eql(u8, event_name.string, "grid_cursor_goto")) {
+            if (std.mem.eql(u8, event_name.string, "grid_resize")) {
+                // event_params is [grid, width, height]
+                if (event_params.array.len < 3) continue;
+
+                const width = switch (event_params.array[1]) {
+                    .unsigned => |u| @as(u16, @intCast(u)),
+                    .integer => |i| @as(u16, @intCast(i)),
+                    else => continue,
+                };
+                const height = switch (event_params.array[2]) {
+                    .unsigned => |u| @as(u16, @intCast(u)),
+                    .integer => |i| @as(u16, @intCast(i)),
+                    else => continue,
+                };
+
+                const winsize: vaxis.Winsize = .{
+                    .rows = height,
+                    .cols = width,
+                    .x_pixel = 0,
+                    .y_pixel = 0,
+                };
+                try self.vx.resize(self.allocator, self.tty.writer(), winsize);
+            } else if (std.mem.eql(u8, event_name.string, "grid_cursor_goto")) {
                 // event_params is [grid, row, col]
                 if (event_params.array.len < 3) continue;
 
@@ -330,7 +392,6 @@ pub const App = struct {
 
     pub fn render(self: *App) !void {
         try self.vx.render(self.tty.writer());
-        try self.tty.writer().flush();
     }
 
     pub fn onConnected(l: *io.Loop, completion: io.Completion) anyerror!void {
@@ -452,11 +513,29 @@ pub const App = struct {
                     },
                     .notification => |notif| {
                         if (std.mem.eql(u8, notif.method, "redraw")) {
+                            std.log.debug("Handling redraw notification", .{});
                             app.handleRedraw(notif.params) catch |err| {
                                 std.log.err("Failed to handle redraw: {}", .{err});
                             };
+                            std.log.debug("Redraw handled, rendering", .{});
+                            app.render() catch |err| {
+                                std.log.err("Failed to render: {}", .{err});
+                            };
+                            std.log.debug("Render complete", .{});
                         }
                     },
+                }
+
+                // Check if we should quit
+                if (app.should_quit) {
+                    std.log.info("Quitting, closing connection", .{});
+                    _ = try l.close(app.fd, .{
+                        .ptr = null,
+                        .cb = struct {
+                            fn noop(_: *io.Loop, _: io.Completion) anyerror!void {}
+                        }.noop,
+                    });
+                    return;
                 }
 
                 // Keep receiving
@@ -470,6 +549,135 @@ pub const App = struct {
             },
             else => unreachable,
         }
+    }
+
+    fn processEvent(self: *App, event: vaxis.Event) !void {
+        std.log.debug("Processing event: {s}", .{@tagName(event)});
+        switch (event) {
+            .key_press => |key| {
+                if (self.should_quit) return;
+
+                // Check for Ctrl+C to quit
+                if (key.codepoint == 'c' and key.mods.ctrl) {
+                    std.log.info("Ctrl+C detected, quitting", .{});
+                    self.should_quit = true;
+                    // Send a ping to wake up the recv loop
+                    self.sendPing() catch {};
+                    return;
+                }
+
+                // Send keyboard input to the PTY
+                if (self.attached and self.pty_id != null) {
+                    try self.sendInput(key);
+                } else {
+                    std.log.debug("Not attached or no PTY, skipping input", .{});
+                }
+            },
+            .winsize => |ws| {
+                std.log.debug("Winsize event: {}x{}", .{ ws.rows, ws.cols });
+                // Send resize to server, which will send us redraw notifications
+                if (self.attached and self.pty_id != null) {
+                    try self.sendResize(ws);
+                } else {
+                    std.log.debug("Not attached or no PTY, skipping resize", .{});
+                }
+            },
+            else => {}, // Ignore other event types
+        }
+        std.log.debug("Event processed", .{});
+    }
+
+    fn sendInput(self: *App, key: vaxis.Key) !void {
+        // Convert vaxis key to Neovim key notation
+        var notation_buf: [32]u8 = undefined;
+        const notation = try key_notation.fromVaxisKey(key, &notation_buf);
+
+        std.log.debug("Sending key: codepoint={} mods=(ctrl={} alt={} shift={}) notation='{s}'", .{
+            key.codepoint,
+            key.mods.ctrl,
+            key.mods.alt,
+            key.mods.shift,
+            notation,
+        });
+
+        // Check if we're already sending something
+        if (self.input_send_buffer != null) {
+            std.log.warn("Dropping key input - send already in progress", .{});
+            return;
+        }
+
+        self.input_send_buffer = try msgpack.encode(self.allocator, .{
+            2, // notification
+            "key_input",
+            .{ self.pty_id.?, notation },
+        });
+
+        const loop = self.io_loop orelse return error.NoIOLoop;
+        std.log.debug("Submitting send operation", .{});
+        _ = try loop.send(self.fd, self.input_send_buffer.?, .{
+            .ptr = self,
+            .cb = onInputSendComplete,
+        });
+        std.log.debug("Send operation submitted", .{});
+    }
+
+    fn onInputSendComplete(_: *io.Loop, completion: io.Completion) anyerror!void {
+        const app = completion.userdataCast(@This());
+
+        std.log.debug("Input send completed", .{});
+
+        if (app.input_send_buffer) |buf| {
+            app.allocator.free(buf);
+            app.input_send_buffer = null;
+        }
+
+        switch (completion.result) {
+            .send => |n| {
+                std.log.debug("Sent {} bytes", .{n});
+            },
+            .err => |err| {
+                std.log.err("Input send failed: {}", .{err});
+            },
+            else => unreachable,
+        }
+    }
+
+    fn sendResize(self: *App, ws: vaxis.Winsize) !void {
+        // Send resize_pty notification to server
+        if (self.input_send_buffer) |old_buf| {
+            self.allocator.free(old_buf);
+        }
+
+        self.input_send_buffer = try msgpack.encode(self.allocator, .{
+            2, // notification
+            "resize_pty",
+            .{ self.pty_id.?, ws.rows, ws.cols },
+        });
+
+        const loop = self.io_loop orelse return error.NoIOLoop;
+        _ = try loop.send(self.fd, self.input_send_buffer.?, .{
+            .ptr = self,
+            .cb = onInputSendComplete,
+        });
+    }
+
+    fn sendPing(self: *App) !void {
+        // Send a ping to wake up the recv loop
+        if (self.input_send_buffer) |old_buf| {
+            self.allocator.free(old_buf);
+        }
+
+        self.input_send_buffer = try msgpack.encode(self.allocator, .{
+            2, // notification
+            "ping",
+            .{},
+        });
+
+        const loop = self.io_loop orelse return error.NoIOLoop;
+        _ = try loop.send(self.fd, self.input_send_buffer.?, .{
+            .ptr = self,
+            .cb = onInputSendComplete,
+        });
     }
 };
 

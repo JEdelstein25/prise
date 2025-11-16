@@ -580,7 +580,6 @@ pub const Decoder = struct {
                 for (arr[0..i]) |prev| {
                     prev.deinit(self.allocator);
                 }
-                self.allocator.free(arr);
                 return err;
             };
         }
