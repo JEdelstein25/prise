@@ -4,33 +4,25 @@ const msgpack = @import("msgpack.zig");
 
 const Surface = @This();
 
-front: *vaxis.Screen,
-back: *vaxis.Screen,
+front: *vaxis.AllocatingScreen,
+back: *vaxis.AllocatingScreen,
 allocator: std.mem.Allocator,
 rows: u16,
 cols: u16,
 dirty: bool = false,
 hl_attrs: std.AutoHashMap(u32, vaxis.Style),
-grapheme_arena: std.heap.ArenaAllocator,
 
 pub fn init(allocator: std.mem.Allocator, rows: u16, cols: u16) !Surface {
-    const front = try allocator.create(vaxis.Screen);
+    const front = try allocator.create(vaxis.AllocatingScreen);
     errdefer allocator.destroy(front);
 
-    const back = try allocator.create(vaxis.Screen);
+    const back = try allocator.create(vaxis.AllocatingScreen);
     errdefer allocator.destroy(back);
 
-    const winsize: vaxis.Winsize = .{
-        .rows = rows,
-        .cols = cols,
-        .x_pixel = 0,
-        .y_pixel = 0,
-    };
-
-    front.* = try vaxis.Screen.init(allocator, winsize);
+    front.* = try vaxis.AllocatingScreen.init(allocator, cols, rows);
     errdefer front.deinit(allocator);
 
-    back.* = try vaxis.Screen.init(allocator, winsize);
+    back.* = try vaxis.AllocatingScreen.init(allocator, cols, rows);
 
     return .{
         .front = front,
@@ -39,7 +31,6 @@ pub fn init(allocator: std.mem.Allocator, rows: u16, cols: u16) !Surface {
         .rows = rows,
         .cols = cols,
         .hl_attrs = std.AutoHashMap(u32, vaxis.Style).init(allocator),
-        .grapheme_arena = std.heap.ArenaAllocator.init(allocator),
     };
 }
 
@@ -49,7 +40,6 @@ pub fn deinit(self: *Surface) void {
     self.back.deinit(self.allocator);
     self.allocator.destroy(self.back);
     self.hl_attrs.deinit();
-    self.grapheme_arena.deinit();
 }
 
 pub fn resize(self: *Surface, rows: u16, cols: u16) !void {
@@ -57,37 +47,26 @@ pub fn resize(self: *Surface, rows: u16, cols: u16) !void {
     self.front.deinit(self.allocator);
     self.back.deinit(self.allocator);
 
-    const winsize: vaxis.Winsize = .{
-        .rows = rows,
-        .cols = cols,
-        .x_pixel = 0,
-        .y_pixel = 0,
-    };
-
     // Reinit with new size
-    self.front.* = try vaxis.Screen.init(self.allocator, winsize);
-    self.back.* = try vaxis.Screen.init(self.allocator, winsize);
+    self.front.* = try vaxis.AllocatingScreen.init(self.allocator, cols, rows);
+    self.back.* = try vaxis.AllocatingScreen.init(self.allocator, cols, rows);
 
     self.rows = rows;
     self.cols = cols;
     self.dirty = true;
 }
 
-pub fn swap(self: *Surface) void {
-    if (!self.dirty) return;
-
-    const tmp = self.front;
-    self.front = self.back;
-    self.back = tmp;
-
-    self.dirty = false;
-}
-
 pub fn applyRedraw(self: *Surface, params: msgpack.Value) !void {
     if (params != .array) return error.InvalidRedrawParams;
 
-    // Reset grapheme arena for this frame
-    _ = self.grapheme_arena.reset(.retain_capacity);
+    std.log.debug("applyRedraw: received params with {} events", .{params.array.len});
+
+    var rows_updated = std.ArrayList(usize).empty;
+    defer rows_updated.deinit(self.allocator);
+
+    // Don't reset the arena or copy - back buffer already has the full state from last render
+    // grid_line events will update only changed rows
+    // The arena keeps growing but only with new/changed cell text
 
     for (params.array) |event_val| {
         if (event_val != .array or event_val.array.len < 2) continue;
@@ -112,7 +91,11 @@ pub fn applyRedraw(self: *Surface, params: msgpack.Value) !void {
                 else => continue,
             };
 
-            try self.resize(height, width);
+            // Only resize if dimensions actually changed
+            if (height != self.rows or width != self.cols) {
+                std.log.debug("grid_resize: resizing from {}x{} to {}x{}", .{ self.cols, self.rows, width, height });
+                try self.resize(height, width);
+            }
         } else if (std.mem.eql(u8, event_name.string, "grid_cursor_goto")) {
             if (event_params.array.len < 3) continue;
 
@@ -148,6 +131,18 @@ pub fn applyRedraw(self: *Surface, params: msgpack.Value) !void {
             const cells = event_params.array[3];
             if (cells != .array) continue;
 
+            try rows_updated.append(self.allocator, row);
+
+            // Log first few cells for row 0 to debug
+            if (row == 0 and cells.array.len > 0) {
+                std.log.debug("grid_line: ROW 0: col={}, cells={}, first cell text='{s}'", .{ col, cells.array.len, if (cells.array[0] == .array and cells.array[0].array.len > 0 and cells.array[0].array[0] == .string)
+                    cells.array[0].array[0].string
+                else
+                    "(not string)" });
+            }
+
+            std.log.debug("grid_line: row={}, col={}, cells={} (updating back buffer)", .{ row, col, cells.array.len });
+
             var current_hl: u32 = 0;
             for (cells.array) |cell| {
                 if (cell != .array or cell.array.len == 0) continue;
@@ -176,9 +171,13 @@ pub fn applyRedraw(self: *Surface, params: msgpack.Value) !void {
                 var i: usize = 0;
                 while (i < repeat) : (i += 1) {
                     if (col < self.cols and row < self.rows) {
-                        const copy = self.grapheme_arena.allocator().dupe(u8, text) catch text;
+                        // Debug: log ALL writes to row 0
+                        if (row == 0 and col <= 5) {
+                            std.log.debug("  writing to ({},{}) text='{s}' repeat={}", .{ col, row, text, repeat });
+                        }
+
                         self.back.writeCell(@intCast(col), @intCast(row), .{
-                            .char = .{ .grapheme = copy },
+                            .char = .{ .grapheme = text },
                             .style = style,
                         });
                     }
@@ -187,7 +186,13 @@ pub fn applyRedraw(self: *Surface, params: msgpack.Value) !void {
             }
             self.dirty = true;
         } else if (std.mem.eql(u8, event_name.string, "grid_clear")) {
-            self.back.clear();
+            std.log.warn("grid_clear received! Clearing back buffer", .{});
+            // Clear all cells in back buffer
+            for (0..self.rows) |row| {
+                for (0..self.cols) |col| {
+                    self.back.writeCell(@intCast(col), @intCast(row), .{});
+                }
+            }
             self.dirty = true;
         } else if (std.mem.eql(u8, event_name.string, "hl_attr_define")) {
             if (event_params.array.len < 2) continue;
@@ -253,23 +258,60 @@ pub fn applyRedraw(self: *Surface, params: msgpack.Value) !void {
 
             try self.hl_attrs.put(id, style);
         } else if (std.mem.eql(u8, event_name.string, "flush")) {
-            // Flush marks the end of a frame - caller should swap after this
+            // Flush marks the end of a frame - copy back to front now
+
+            // Debug: check what's in back buffer at (0,0)
+            if (self.back.readCell(0, 0)) |cell| {
+                std.log.debug("flush: back(0,0) = '{s}'", .{cell.char.grapheme});
+            }
+
+            std.log.debug("flush: copying back→front", .{});
+            for (0..self.rows) |row| {
+                for (0..self.cols) |col| {
+                    if (self.back.readCell(@intCast(col), @intCast(row))) |cell| {
+                        self.front.writeCell(@intCast(col), @intCast(row), cell);
+                    }
+                }
+            }
+            self.front.cursor_row = self.back.cursor_row;
+            self.front.cursor_col = self.back.cursor_col;
+            self.front.cursor_vis = self.back.cursor_vis;
+
+            // Debug: check what got copied to front at (0,0)
+            if (self.front.readCell(0, 0)) |cell| {
+                std.log.debug("flush: front(0,0) after copy = '{s}'", .{cell.char.grapheme});
+            }
         }
     }
+
+    std.log.debug("applyRedraw: updated {} rows", .{rows_updated.items.len});
 }
 
 pub fn render(self: *Surface, win: vaxis.Window) void {
+    if (!self.dirty) return;
+
+    std.log.debug("render: copying front→vaxis window", .{});
+
+    var cells_written: usize = 0;
     // Copy front buffer to vaxis window
     for (0..self.rows) |row| {
         for (0..self.cols) |col| {
             if (col < win.width and row < win.height) {
                 const cell = self.front.readCell(@intCast(col), @intCast(row)) orelse continue;
+
+                // Debug: log what we write to (0,0)
+                if (row == 0 and col == 0) {
+                    std.log.debug("render: writing to (0,0): '{s}'", .{cell.char.grapheme});
+                }
+
                 win.writeCell(@intCast(col), @intCast(row), cell);
+                cells_written += 1;
             }
         }
     }
+    std.log.debug("render: wrote {} cells to vaxis window", .{cells_written});
 
-    // Copy cursor state
+    // Copy cursor state to window
     if (self.front.cursor_vis and
         self.front.cursor_col < win.width and
         self.front.cursor_row < win.height)
@@ -278,4 +320,6 @@ pub fn render(self: *Surface, win: vaxis.Window) void {
     } else {
         win.hideCursor();
     }
+
+    self.dirty = false;
 }

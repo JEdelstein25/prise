@@ -179,6 +179,29 @@ pub const App = struct {
 
     pub fn deinit(self: *App) void {
         self.should_quit = true;
+
+        std.log.debug("deinit: recv_task={} io_loop={}", .{ self.recv_task != null, self.io_loop != null });
+
+        // Cancel pending recv task
+        if (self.recv_task) |*task| {
+            std.log.debug("deinit: cancelling recv task id={}", .{task.id});
+            if (self.io_loop) |loop| {
+                task.cancel(loop) catch |err| {
+                    std.log.warn("Failed to cancel recv task: {}", .{err});
+                };
+            } else {
+                std.log.warn("deinit: io_loop is null, cannot cancel recv task", .{});
+            }
+            self.recv_task = null;
+        } else {
+            std.log.debug("deinit: no recv_task to cancel", .{});
+        }
+
+        // Close the socket
+        if (self.connected) {
+            posix.close(self.fd);
+        }
+
         // Wait for TTY thread to exit naturally (it checks should_quit)
         if (self.tty_thread) |thread| {
             thread.join();
@@ -196,13 +219,9 @@ pub const App = struct {
         self.io_loop = loop;
 
         try self.vx.enterAltScreen(self.tty.writer());
-        try self.vx.queryTerminal(self.tty.writer(), 1 * std.time.ns_per_s);
 
-        // Initialize surface with current terminal size
-        const win = self.vx.window();
-        self.surface = try Surface.init(self.allocator, win.height, win.width);
-
-        try self.render();
+        // Don't initialize surface yet - wait for first winsize event from TTY thread
+        // The surface will be created when we get the window size
 
         // Register pipe read end with io.Loop
         self.pipe_read_task = try loop.read(self.pipe_read_fd, &self.pipe_recv_buffer, .{
@@ -395,6 +414,33 @@ pub const App = struct {
                 else => return,
             };
 
+            std.log.debug("Resize event: {}x{}", .{ cols, rows });
+
+            // Resize vaxis
+            const winsize: vaxis.Winsize = .{
+                .rows = rows,
+                .cols = cols,
+                .x_pixel = 0,
+                .y_pixel = 0,
+            };
+            self.vx.resize(self.allocator, self.tty.writer(), winsize) catch |err| {
+                std.log.err("Failed to resize vaxis: {}", .{err});
+                return;
+            };
+
+            // Create or resize surface
+            if (self.surface) |*surface| {
+                surface.resize(rows, cols) catch |err| {
+                    std.log.err("Failed to resize surface: {}", .{err});
+                };
+            } else {
+                self.surface = Surface.init(self.allocator, rows, cols) catch |err| {
+                    std.log.err("Failed to create surface: {}", .{err});
+                    return;
+                };
+                std.log.info("Surface initialized: {}x{}", .{ cols, rows });
+            }
+
             // Send to server
             if (self.attached and self.pty_id != null) {
                 const msg = try msgpack.encode(self.allocator, .{
@@ -410,14 +456,26 @@ pub const App = struct {
             std.log.info("Quit message received", .{});
             self.should_quit = true;
 
-            // Close socket and pipes - this cancels all pending operations
-            posix.close(self.fd);
-            posix.close(self.pipe_read_fd);
-            posix.close(self.pipe_write_fd);
+            // Cancel the recv task to unblock the event loop
+            if (self.recv_task) |*task| {
+                if (self.io_loop) |loop| {
+                    task.cancel(loop) catch |err| {
+                        std.log.warn("Failed to cancel recv task in quit handler: {}", .{err});
+                    };
+                    self.recv_task = null;
+                }
+            }
+
+            // Close socket to ensure recv completes
+            if (self.connected) {
+                posix.close(self.fd);
+                self.connected = false;
+            }
         }
     }
 
     pub fn handleRedraw(self: *App, params: msgpack.Value) !void {
+        std.log.debug("handleRedraw: received redraw params", .{});
         if (self.surface) |*surface| {
             try surface.applyRedraw(params);
 
@@ -427,7 +485,7 @@ pub const App = struct {
                     if (event_val != .array or event_val.array.len < 1) continue;
                     const event_name = event_val.array[0];
                     if (event_name == .string and std.mem.eql(u8, event_name.string, "flush")) {
-                        surface.swap();
+                        std.log.debug("handleRedraw: flush event received, rendering", .{});
                         try self.render();
                         return;
                     }
@@ -437,11 +495,16 @@ pub const App = struct {
     }
 
     pub fn render(self: *App) !void {
+        std.log.debug("render: starting render", .{});
         if (self.surface) |*surface| {
             const win = self.vx.window();
             surface.render(win);
         }
+        std.log.debug("render: calling vx.render()", .{});
         try self.vx.render(self.tty.writer());
+        std.log.debug("render: flushing tty", .{});
+        try self.tty.tty_writer.interface.flush();
+        std.log.debug("render: complete", .{});
     }
 
     pub fn onConnected(l: *io.Loop, completion: io.Completion) anyerror!void {
@@ -454,6 +517,12 @@ pub const App = struct {
                 std.log.info("Connected! fd={}", .{app.fd});
 
                 if (!app.should_quit) {
+                    // Start receiving from the server
+                    app.recv_task = try l.recv(fd, &app.recv_buffer, .{
+                        .ptr = app,
+                        .cb = onRecv,
+                    });
+
                     app.send_buffer = try msgpack.encode(app.allocator, .{ 0, @intFromEnum(MsgId.spawn_pty), "spawn_pty", .{} });
 
                     app.send_task = try l.send(fd, app.send_buffer.?, .{
@@ -532,6 +601,7 @@ pub const App = struct {
                                             std.log.info("PTY spawned with ID: {}", .{i});
 
                                             // Attach to the session
+                                            std.log.info("Sending attach_pty for session {}", .{i});
                                             app.send_buffer = try msgpack.encode(app.allocator, .{ 0, @intFromEnum(MsgId.attach_pty), "attach_pty", .{i} });
                                             _ = try l.send(app.fd, app.send_buffer.?, .{
                                                 .ptr = app,
@@ -548,6 +618,7 @@ pub const App = struct {
                                             std.log.info("PTY spawned with ID: {}", .{u});
 
                                             // Attach to the session
+                                            std.log.info("Sending attach_pty for session {}", .{u});
                                             app.send_buffer = try msgpack.encode(app.allocator, .{ 0, @intFromEnum(MsgId.attach_pty), "attach_pty", .{u} });
                                             _ = try l.send(app.fd, app.send_buffer.?, .{
                                                 .ptr = app,

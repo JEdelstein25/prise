@@ -335,11 +335,20 @@ const Client = struct {
     server: *Server,
     recv_buffer: [4096]u8 = undefined,
     send_buffer: ?[]u8 = null,
+    send_queue: std.ArrayList([]u8),
     attached_sessions: std.ArrayList(usize),
     seen_styles: std.AutoHashMap(u16, void),
 
     fn sendData(self: *Client, loop: *io.Loop, data: []const u8) !void {
         const buf = try self.server.allocator.dupe(u8, data);
+
+        // If there's a pending send, queue this one
+        if (self.send_buffer != null) {
+            try self.send_queue.append(self.server.allocator, buf);
+            return;
+        }
+
+        // Otherwise send immediately
         self.send_buffer = buf;
         _ = try loop.send(self.fd, buf, .{
             .ptr = self,
@@ -347,7 +356,7 @@ const Client = struct {
         });
     }
 
-    fn onSendComplete(_: *io.Loop, completion: io.Completion) anyerror!void {
+    fn onSendComplete(loop: *io.Loop, completion: io.Completion) anyerror!void {
         const client = completion.userdataCast(Client);
 
         // Free send buffer
@@ -357,9 +366,24 @@ const Client = struct {
         }
 
         switch (completion.result) {
-            .send => {},
+            .send => {
+                // Send next queued message if any
+                if (client.send_queue.items.len > 0) {
+                    const next_buf = client.send_queue.orderedRemove(0);
+                    client.send_buffer = next_buf;
+                    _ = try loop.send(client.fd, next_buf, .{
+                        .ptr = client,
+                        .cb = onSendComplete,
+                    });
+                }
+            },
             .err => |err| {
                 std.log.err("Send failed: {}", .{err});
+                // Clear queue on error
+                for (client.send_queue.items) |buf| {
+                    client.server.allocator.free(buf);
+                }
+                client.send_queue.clearRetainingCapacity();
             },
             else => unreachable,
         }
@@ -635,11 +659,21 @@ const Server = struct {
             return msgpack.Value{ .unsigned = session_id };
         } else if (std.mem.eql(u8, method, "attach_pty")) {
             std.log.info("attach_pty called with params: {}", .{params});
-            if (params != .array or params.array.len < 1 or params.array[0] != .unsigned) {
-                std.log.warn("attach_pty: invalid params", .{});
+            if (params != .array or params.array.len < 1) {
+                std.log.warn("attach_pty: invalid params (not array or empty)", .{});
                 return msgpack.Value{ .string = try self.allocator.dupe(u8, "invalid params") };
             }
-            const session_id: usize = @intCast(params.array[0].unsigned);
+
+            std.log.debug("attach_pty: params[0] type={}", .{params.array[0]});
+
+            const session_id: usize = switch (params.array[0]) {
+                .unsigned => |u| @intCast(u),
+                .integer => |i| @intCast(i),
+                else => {
+                    std.log.warn("attach_pty: invalid params (not unsigned)", .{});
+                    return msgpack.Value{ .string = try self.allocator.dupe(u8, "invalid params") };
+                },
+            };
 
             std.log.info("attach_pty: session_id={} client_fd={}", .{ session_id, client.fd });
 
@@ -661,7 +695,7 @@ const Server = struct {
             );
             defer state.deinit();
 
-            try self.sendRedraw(self.loop, pty_instance, &state, client);
+            try self.sendRedraw(self.loop, pty_instance, &state, client, .full);
 
             return msgpack.Value{ .unsigned = session_id };
         } else if (std.mem.eql(u8, method, "write_pty")) {
@@ -812,6 +846,7 @@ const Server = struct {
                 client.* = .{
                     .fd = client_fd,
                     .server = self,
+                    .send_queue = std.ArrayList([]u8).empty,
                     .attached_sessions = std.ArrayList(usize).empty,
                     .seen_styles = std.AutoHashMap(u16, void).init(self.allocator),
                 };
@@ -843,6 +878,13 @@ const Server = struct {
         std.log.debug("Removing client fd={}", .{client.fd});
         // Cleanup sessions (kill if no clients remain and not keep_alive)
         self.cleanupSessionsForClient(client);
+
+        // Free any queued sends
+        for (client.send_queue.items) |buf| {
+            self.allocator.free(buf);
+        }
+        client.send_queue.deinit(self.allocator);
+
         client.attached_sessions.deinit(self.allocator);
         client.seen_styles.deinit();
 
@@ -930,14 +972,20 @@ const Server = struct {
     }
 
     /// Build and send redraw notification for a session to attached clients
-    fn sendRedraw(self: *Server, loop: *io.Loop, pty_instance: *Pty, state: *ScreenState, target_client: ?*Client) !void {
+    fn sendRedraw(self: *Server, loop: *io.Loop, pty_instance: *Pty, state: *ScreenState, target_client: ?*Client, mode: ScreenState.RenderMode) !void {
         const redraw = @import("redraw.zig");
+
+        std.log.debug("sendRedraw: session={} rows={} cols={} mode={} target_client={} total_clients={}", .{ pty_instance.id, state.rows, state.cols, mode, target_client != null, self.clients.items.len });
 
         // Send to each client attached to this session
         for (self.clients.items) |client| {
+            std.log.debug("sendRedraw: checking client fd={}", .{client.fd});
             // If we have a target client, skip others
             if (target_client) |target| {
-                if (client != target) continue;
+                if (client != target) {
+                    std.log.debug("sendRedraw: skipping client fd={} (not target)", .{client.fd});
+                    continue;
+                }
             }
 
             // Check if client is attached to this session
@@ -948,6 +996,7 @@ const Server = struct {
                     break;
                 }
             }
+            std.log.debug("sendRedraw: client fd={} attached={} attached_sessions={}", .{ client.fd, attached, client.attached_sessions.items.len });
             if (!attached) {
                 continue;
             }
@@ -955,8 +1004,10 @@ const Server = struct {
             var builder = redraw.RedrawBuilder.init(self.allocator);
             defer builder.deinit();
 
-            // Send grid_resize if needed (always send for simplicity now)
-            try builder.gridResize(1, @intCast(state.cols), @intCast(state.rows));
+            // Send grid_resize only on full redraw
+            if (mode == .full) {
+                try builder.gridResize(1, @intCast(state.cols), @intCast(state.rows));
+            }
 
             // Track which styles we need to define
             var styles_to_define = std.ArrayList(u16).empty;
@@ -1037,6 +1088,7 @@ const Server = struct {
             const msg = try builder.build();
             defer self.allocator.free(msg);
 
+            std.log.debug("sendRedraw: sending {} bytes to client fd={}", .{ msg.len, client.fd });
             try client.sendData(loop, msg);
         }
     }
@@ -1055,7 +1107,7 @@ const Server = struct {
         defer state.deinit();
 
         // Build and send redraw notifications
-        self.sendRedraw(self.loop, pty_instance, &state, null) catch |err| {
+        self.sendRedraw(self.loop, pty_instance, &state, null, .incremental) catch |err| {
             std.log.err("Failed to send redraw for session {}: {}", .{ pty_instance.id, err });
         };
 
