@@ -12,6 +12,20 @@ zigdoc ghostty-vt.Terminal
 zigdoc vaxis.Window
 ```
 
+## Code Style
+
+Prefer explicit type annotation with anonymous struct literals over explicit type instantiation.
+
+Good:
+```zig
+const foo: Type = .{ ... };
+```
+
+Bad:
+```zig
+const foo = Type{ ... };
+```
+
 ## Build Commands
 
 - Build and run: `zig build run`
