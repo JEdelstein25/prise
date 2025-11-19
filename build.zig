@@ -24,6 +24,13 @@ pub fn build(b: *std.Build) void {
         exe_mod.addImport("vaxis", dep.module("vaxis"));
     }
 
+    const zlua = b.dependency("zlua", .{
+        .target = target,
+        .optimize = optimize,
+        .lang = .lua54,
+    });
+    exe_mod.addImport("zlua", zlua.module("zlua"));
+
     const exe = b.addExecutable(.{
         .name = "prise",
         .root_module = exe_mod,
