@@ -729,47 +729,95 @@ const Server = struct {
     accept_task: ?io.Task = null,
     exit_on_idle: bool = false,
 
+    fn parseSpawnPtyParams(params: msgpack.Value) pty.winsize {
+        return .{
+            .ws_row = if (params == .array and params.array.len > 0 and params.array[0] == .unsigned)
+                @intCast(params.array[0].unsigned)
+            else
+                24,
+            .ws_col = if (params == .array and params.array.len > 1 and params.array[1] == .unsigned)
+                @intCast(params.array[1].unsigned)
+            else
+                80,
+            .ws_xpixel = 0,
+            .ws_ypixel = 0,
+        };
+    }
+
+    fn prepareSpawnEnv(allocator: std.mem.Allocator, env_map: *std.process.EnvMap) !std.ArrayList([]const u8) {
+        try env_map.put("TERM", "xterm-256color");
+        try env_map.put("COLORTERM", "truecolor");
+
+        var env_list = std.ArrayList([]const u8).empty;
+        var it = env_map.iterator();
+        while (it.next()) |entry| {
+            const key_eq_val = try std.fmt.allocPrint(allocator, "{s}={s}", .{ entry.key_ptr.*, entry.value_ptr.* });
+            try env_list.append(allocator, key_eq_val);
+        }
+        return env_list;
+    }
+
+    fn parseAttachPtyParams(params: msgpack.Value) !usize {
+        if (params != .array or params.array.len < 1) {
+            return error.InvalidParams;
+        }
+        return switch (params.array[0]) {
+            .unsigned => |u| @intCast(u),
+            .integer => |i| @intCast(i),
+            else => error.InvalidParams,
+        };
+    }
+
+    fn parseWritePtyParams(params: msgpack.Value) !struct { id: usize, data: []const u8 } {
+        if (params != .array or params.array.len < 2 or params.array[0] != .unsigned or params.array[1] != .binary) {
+            return error.InvalidParams;
+        }
+        return .{
+            .id = @intCast(params.array[0].unsigned),
+            .data = params.array[1].binary,
+        };
+    }
+
+    fn parseResizePtyParams(params: msgpack.Value) !struct { id: usize, rows: u16, cols: u16 } {
+        if (params != .array or params.array.len < 3 or params.array[0] != .unsigned or params.array[1] != .unsigned or params.array[2] != .unsigned) {
+            return error.InvalidParams;
+        }
+        return .{
+            .id = @intCast(params.array[0].unsigned),
+            .rows = @intCast(params.array[1].unsigned),
+            .cols = @intCast(params.array[2].unsigned),
+        };
+    }
+
+    fn parseDetachPtyParams(params: msgpack.Value) !struct { id: usize, client_fd: posix.fd_t } {
+        if (params != .array or params.array.len < 2 or params.array[0] != .unsigned or params.array[1] != .unsigned) {
+            return error.InvalidParams;
+        }
+        return .{
+            .id = @intCast(params.array[0].unsigned),
+            .client_fd = @intCast(params.array[1].unsigned),
+        };
+    }
+
     fn handleRequest(self: *Server, client: *Client, method: []const u8, params: msgpack.Value) !msgpack.Value {
         if (std.mem.eql(u8, method, "ping")) {
             return msgpack.Value{ .string = try self.allocator.dupe(u8, "pong") };
         } else if (std.mem.eql(u8, method, "spawn_pty")) {
-            const size: pty.winsize = .{
-                .ws_row = if (params == .array and params.array.len > 0 and params.array[0] == .unsigned)
-                    @intCast(params.array[0].unsigned)
-                else
-                    24,
-                .ws_col = if (params == .array and params.array.len > 1 and params.array[1] == .unsigned)
-                    @intCast(params.array[1].unsigned)
-                else
-                    80,
-                .ws_xpixel = 0,
-                .ws_ypixel = 0,
-            };
+            const size = parseSpawnPtyParams(params);
 
             const shell = std.posix.getenv("SHELL") orelse "/bin/sh";
 
-            // Prepare environment with TERM and COLORTERM
+            // Prepare environment
             var env_map = try std.process.getEnvMap(self.allocator);
             defer env_map.deinit();
 
-            try env_map.put("TERM", "xterm-256color");
-            try env_map.put("COLORTERM", "truecolor");
-
-            // Convert EnvMap to []const []const u8
-            var env_list = std.ArrayList([]const u8).empty;
-            defer env_list.deinit(self.allocator);
-
-            var it = env_map.iterator();
-            while (it.next()) |entry| {
-                const key_eq_val = try std.fmt.allocPrint(self.allocator, "{s}={s}", .{ entry.key_ptr.*, entry.value_ptr.* });
-                try env_list.append(self.allocator, key_eq_val);
-            }
-
+            var env_list = try prepareSpawnEnv(self.allocator, &env_map);
             // Manage lifetime of strings in env_list
             defer {
                 for (env_list.items) |item| {
                     self.allocator.free(item);
                 }
+                env_list.deinit(self.allocator);
             }
 
             const process = try pty.Process.spawn(self.allocator, size, &.{shell}, @ptrCast(env_list.items));
@@ -795,20 +843,9 @@ const Server = struct {
             return msgpack.Value{ .unsigned = session_id };
         } else if (std.mem.eql(u8, method, "attach_pty")) {
             std.log.info("attach_pty called with params: {}", .{params});
-            if (params != .array or params.array.len < 1) {
-                std.log.warn("attach_pty: invalid params (not array or empty)", .{});
+            const session_id = parseAttachPtyParams(params) catch |err| {
+                std.log.warn("attach_pty: invalid params: {}", .{err});
                 return msgpack.Value{ .string = try self.allocator.dupe(u8, "invalid params") };
-            }
-
-            std.log.debug("attach_pty: params[0] type={}", .{params.array[0]});
-
-            const session_id: usize = switch (params.array[0]) {
-                .unsigned => |u| @intCast(u),
-                .integer => |i| @intCast(i),
-                else => {
-                    std.log.warn("attach_pty: invalid params (not unsigned)", .{});
-                    return msgpack.Value{ .string = try self.allocator.dupe(u8, "invalid params") };
-                },
             };
 
             std.log.info("attach_pty: session_id={} client_fd={}", .{ session_id, client.fd });
@@ -835,11 +872,11 @@ const Server = struct {
 
             return msgpack.Value{ .unsigned = session_id };
         } else if (std.mem.eql(u8, method, "write_pty")) {
-            if (params != .array or params.array.len < 2 or params.array[0] != .unsigned or params.array[1] != .binary) {
+            const args = parseWritePtyParams(params) catch {
                 return msgpack.Value{ .string = try self.allocator.dupe(u8, "invalid params") };
-            }
-            const session_id: usize = @intCast(params.array[0].unsigned);
-            const data = params.array[1].binary;
+            };
+            const session_id = args.id;
+            const data = args.data;
 
             const pty_instance = self.ptys.get(session_id) orelse {
                 return msgpack.Value{ .string = try self.allocator.dupe(u8, "session not found") };
@@ -852,12 +889,12 @@ const Server = struct {
 
             return msgpack.Value.nil;
         } else if (std.mem.eql(u8, method, "resize_pty")) {
-            if (params != .array or params.array.len < 3 or params.array[0] != .unsigned or params.array[1] != .unsigned or params.array[2] != .unsigned) {
+            const args = parseResizePtyParams(params) catch {
                 return msgpack.Value{ .string = try self.allocator.dupe(u8, "invalid params") };
-            }
-            const session_id: usize = @intCast(params.array[0].unsigned);
-            const rows: u16 = @intCast(params.array[1].unsigned);
-            const cols: u16 = @intCast(params.array[2].unsigned);
+            };
+            const session_id = args.id;
+            const rows = args.rows;
+            const cols = args.cols;
 
             const pty_instance = self.ptys.get(session_id) orelse {
                 return msgpack.Value{ .string = try self.allocator.dupe(u8, "session not found") };
@@ -890,11 +927,11 @@ const Server = struct {
             std.log.info("Resized session {} to {}x{}", .{ session_id, rows, cols });
             return msgpack.Value.nil;
         } else if (std.mem.eql(u8, method, "detach_pty")) {
-            if (params != .array or params.array.len < 2 or params.array[0] != .unsigned or params.array[1] != .unsigned) {
+            const args = parseDetachPtyParams(params) catch {
                 return msgpack.Value{ .string = try self.allocator.dupe(u8, "invalid params") };
-            }
-            const session_id: usize = @intCast(params.array[0].unsigned);
-            const client_fd: posix.fd_t = @intCast(params.array[1].unsigned);
+            };
+            const session_id = args.id;
+            const client_fd = args.client_fd;
 
             const pty_instance = self.ptys.get(session_id) orelse {
                 return msgpack.Value{ .string = try self.allocator.dupe(u8, "session not found") };
@@ -1051,8 +1088,86 @@ const Server = struct {
     }
 
     /// Build and send redraw notification for a session to attached clients
+    fn buildRedrawMessage(allocator: std.mem.Allocator, pty_id: usize, state: *ScreenState, mode: ScreenState.RenderMode) ![]u8 {
+        var builder = redraw.RedrawBuilder.init(allocator);
+        defer builder.deinit();
+
+        if (mode == .full) {
+            try builder.resize(@intCast(pty_id), @intCast(state.rows), @intCast(state.cols));
+        }
+
+        // Define all styles used in this frame
+        var it = state.styles.iterator();
+        while (it.next()) |entry| {
+            try builder.style(entry.key_ptr.*, entry.value_ptr.*);
+        }
+
+        // Build write events for each dirty row
+        for (state.rows_data) |row| {
+            var cells_buf = std.ArrayList(redraw.UIEvent.Write.Cell).empty;
+            defer cells_buf.deinit(allocator);
+
+            // Track the last style ID sent to optimize output
+            var last_hl_id: u32 = 0;
+
+            var x: usize = 0;
+            while (x < state.cols) {
+                if (x >= row.cells.len) break;
+                const cell = &row.cells[x];
+
+                // Count consecutive cells with same style
+                var repeat: usize = 1;
+                var next_x = x + 1;
+                if (cell.wide) next_x += 1; // Skip spacer for wide char
+
+                while (next_x < state.cols and next_x < row.cells.len) {
+                    const next_cell = &row.cells[next_x];
+                    if (next_cell.style_id != cell.style_id) break;
+                    if (!std.mem.eql(u8, next_cell.text, cell.text)) break;
+
+                    repeat += 1;
+                    next_x += 1;
+                    if (next_cell.wide) next_x += 1;
+                }
+
+                // Determine if we need to send the style ID
+                const hl_id_to_send: ?u32 = if (cell.style_id != last_hl_id) cell.style_id else null;
+                if (hl_id_to_send) |id| {
+                    last_hl_id = id;
+                }
+
+                try cells_buf.append(allocator, .{
+                    .grapheme = cell.text,
+                    .style_id = hl_id_to_send,
+                    .repeat = if (repeat > 1) @intCast(repeat) else null,
+                });
+
+                x = next_x;
+            }
+
+            if (cells_buf.items.len > 0) {
+                try builder.write(@intCast(pty_id), @intCast(row.y), 0, cells_buf.items);
+            }
+        }
+
+        // Send cursor position
+        if (state.cursor_visible) {
+            try builder.cursorPos(@intCast(pty_id), @intCast(state.cursor_y), @intCast(state.cursor_x));
+        }
+
+        // Send cursor shape
+        try builder.cursorShape(@intCast(pty_id), state.cursor_shape);
+
+        try builder.flush();
+        return builder.build();
+    }
+
+    /// Build and send redraw notification for a session to attached clients
     fn sendRedraw(self: *Server, loop: *io.Loop, pty_instance: *Pty, state: *ScreenState, target_client: ?*Client, mode: ScreenState.RenderMode) !void {
         std.log.debug("sendRedraw: session={} rows={} cols={} mode={} target_client={} total_clients={}", .{ pty_instance.id, state.rows, state.cols, mode, target_client != null, self.clients.items.len });
+
+        const msg = try buildRedrawMessage(self.allocator, pty_instance.id, state, mode);
+        defer self.allocator.free(msg);
 
         // Send to each client attached to this session
         for (self.clients.items) |client| {
@@ -1077,95 +1192,6 @@ const Server = struct {
             if (!attached) {
                 continue;
             }
-
-            var builder = redraw.RedrawBuilder.init(self.allocator);
-            defer builder.deinit();
-
-            // Send resize only on full redraw or if client hasn't seen it?
-            // Protocol says "resize" is an event.
-            // For simplicity, always send resize on full redraw.
-            if (mode == .full) {
-                try builder.resize(@intCast(pty_instance.id), @intCast(state.rows), @intCast(state.cols));
-            }
-
-            // Define all styles used in this frame
-            // We are stateless between frames, so we send definitions for everything we use.
-            // This handles page switches where style IDs might be reused with different values.
-            var it = state.styles.iterator();
-            while (it.next()) |entry| {
-                try builder.style(entry.key_ptr.*, entry.value_ptr.*);
-            }
-
-            // Build write events for each dirty row
-            for (state.rows_data) |row| {
-                var cells_buf = std.ArrayList(redraw.UIEvent.Write.Cell).empty;
-                defer cells_buf.deinit(self.allocator);
-
-                // Track the last style ID sent to optimize output
-                var last_hl_id: u32 = 0;
-
-                var x: usize = 0;
-                while (x < state.cols) {
-                    if (x >= row.cells.len) break;
-                    const cell = &row.cells[x];
-
-                    // Skip empty spacer tails
-                    // if (cell.text.len == 0) {
-                    //     x += 1;
-                    //     continue;
-                    // }
-
-                    // Count consecutive cells with same style
-                    var repeat: usize = 1;
-                    var next_x = x + 1;
-                    if (cell.wide) next_x += 1; // Skip spacer for wide char
-
-                    while (next_x < state.cols and next_x < row.cells.len) {
-                        const next_cell = &row.cells[next_x];
-                        if (next_cell.style_id != cell.style_id) break;
-                        if (!std.mem.eql(u8, next_cell.text, cell.text)) break;
-                        // if (next_cell.text.len == 0) break; // Skip spacers
-
-                        repeat += 1;
-                        next_x += 1;
-                        if (next_cell.wide) next_x += 1;
-                    }
-
-                    // Determine if we need to send the style ID
-                    // We send it if it's different from the last one we sent (or implied)
-                    const hl_id_to_send: ?u32 = if (cell.style_id != last_hl_id) cell.style_id else null;
-                    if (hl_id_to_send) |id| {
-                        last_hl_id = id;
-                    }
-
-                    try cells_buf.append(self.allocator, .{
-                        .grapheme = cell.text,
-                        .style_id = hl_id_to_send,
-                        .repeat = if (repeat > 1) @intCast(repeat) else null,
-                    });
-
-                    x = next_x;
-                }
-
-                if (cells_buf.items.len > 0) {
-                    try builder.write(@intCast(pty_instance.id), @intCast(row.y), 0, cells_buf.items);
-                }
-            }
-
-            // Send cursor position
-            if (state.cursor_visible) {
-                try builder.cursorPos(@intCast(pty_instance.id), @intCast(state.cursor_y), @intCast(state.cursor_x));
-            }
-
-            // Send cursor shape
-            try builder.cursorShape(@intCast(pty_instance.id), state.cursor_shape);
-
-            // Flush
-            try builder.flush();
-
-            // Build and send the notification
-            const msg = try builder.build();
-            defer self.allocator.free(msg);
 
             std.log.debug("sendRedraw: sending {} bytes to client fd={}", .{ msg.len, client.fd });
             try client.sendData(loop, msg);
@@ -1541,4 +1567,142 @@ test "server lifecycle - recv error triggers disconnect" {
     try loop.run(.once);
     try testing.expectEqual(@as(usize, 0), server.clients.items.len);
     try testing.expect(!server.accepting);
+}
+
+test "parseSpawnPtyParams" {
+    const testing = std.testing;
+
+    // Empty params - defaults
+    var empty_args = [_]msgpack.Value{};
+    const p1 = Server.parseSpawnPtyParams(.{ .array = &empty_args });
+    try testing.expectEqual(@as(u16, 24), p1.ws_row);
+    try testing.expectEqual(@as(u16, 80), p1.ws_col);
+
+    // Full params
+    var args = [_]msgpack.Value{
+        .{ .unsigned = 40 },
+        .{ .unsigned = 100 },
+    };
+    const p2 = Server.parseSpawnPtyParams(.{ .array = &args });
+    try testing.expectEqual(@as(u16, 40), p2.ws_row);
+    try testing.expectEqual(@as(u16, 100), p2.ws_col);
+}
+
+test "prepareSpawnEnv" {
+    const testing = std.testing;
+    var env_map = std.process.EnvMap.init(testing.allocator);
+    defer env_map.deinit();
+
+    try env_map.put("EXISTING", "value");
+
+    var list = try Server.prepareSpawnEnv(testing.allocator, &env_map);
+    defer {
+        for (list.items) |item| testing.allocator.free(item);
+        list.deinit(testing.allocator);
+    }
+
+    var found_term = false;
+    var found_colorterm = false;
+    var found_existing = false;
+
+    for (list.items) |item| {
+        if (std.mem.startsWith(u8, item, "TERM=")) found_term = true;
+        if (std.mem.startsWith(u8, item, "COLORTERM=")) found_colorterm = true;
+        if (std.mem.startsWith(u8, item, "EXISTING=")) found_existing = true;
+    }
+
+    try testing.expect(found_term);
+    try testing.expect(found_colorterm);
+    try testing.expect(found_existing);
+}
+
+test "parseAttachPtyParams" {
+    const testing = std.testing;
+
+    var valid_args = [_]msgpack.Value{.{ .unsigned = 42 }};
+    const id = try Server.parseAttachPtyParams(.{ .array = &valid_args });
+    try testing.expectEqual(@as(usize, 42), id);
+
+    var invalid_args = [_]msgpack.Value{};
+    try testing.expectError(error.InvalidParams, Server.parseAttachPtyParams(.{ .array = &invalid_args }));
+}
+
+test "parseWritePtyParams" {
+    const testing = std.testing;
+
+    var valid_args = [_]msgpack.Value{
+        .{ .unsigned = 42 },
+        .{ .binary = "hello" },
+    };
+    const args = try Server.parseWritePtyParams(.{ .array = &valid_args });
+    try testing.expectEqual(@as(usize, 42), args.id);
+    try testing.expectEqualStrings("hello", args.data);
+}
+
+test "parseResizePtyParams" {
+    const testing = std.testing;
+
+    var valid_args = [_]msgpack.Value{
+        .{ .unsigned = 42 },
+        .{ .unsigned = 50 },
+        .{ .unsigned = 80 },
+    };
+    const args = try Server.parseResizePtyParams(.{ .array = &valid_args });
+    try testing.expectEqual(@as(usize, 42), args.id);
+    try testing.expectEqual(@as(u16, 50), args.rows);
+    try testing.expectEqual(@as(u16, 80), args.cols);
+}
+
+test "parseDetachPtyParams" {
+    const testing = std.testing;
+
+    var valid_args = [_]msgpack.Value{
+        .{ .unsigned = 42 },
+        .{ .unsigned = 10 },
+    };
+    const args = try Server.parseDetachPtyParams(.{ .array = &valid_args });
+    try testing.expectEqual(@as(usize, 42), args.id);
+    try testing.expectEqual(@as(posix.fd_t, 10), args.client_fd);
+}
+
+test "buildRedrawMessage" {
+    const testing = std.testing;
+    var rows_data = std.ArrayList(ScreenState.DirtyRow).empty;
+    defer {
+        for (rows_data.items) |row| {
+            for (row.cells) |cell| testing.allocator.free(cell.text);
+            testing.allocator.free(row.cells);
+        }
+        rows_data.deinit(testing.allocator);
+    }
+
+    // Create a row with one cell
+    var cells = try testing.allocator.alloc(ScreenState.CellData, 1);
+    cells[0] = .{
+        .text = try testing.allocator.dupe(u8, "A"),
+        .style_id = 1,
+        .wide = false,
+    };
+    try rows_data.append(testing.allocator, .{ .y = 0, .cells = cells });
+
+    var styles = std.AutoHashMap(u16, redraw.UIEvent.Style.Attributes).init(testing.allocator);
+    defer styles.deinit();
+    try styles.put(1, .{ .fg = 0xFF0000 });
+
+    var state = ScreenState{
+        .rows = 24,
+        .cols = 80,
+        .cursor_x = 5,
+        .cursor_y = 10,
+        .cursor_visible = true,
+        .cursor_shape = .block,
+        .rows_data = rows_data.items,
+        .styles = styles,
+        .allocator = testing.allocator,
+    };
+
+    const msg = try Server.buildRedrawMessage(testing.allocator, 1, &state, .full);
+    defer testing.allocator.free(msg);
+
+    try testing.expect(msg.len > 0);
 }
