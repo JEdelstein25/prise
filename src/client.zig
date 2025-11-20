@@ -774,6 +774,61 @@ pub const App = struct {
         }
     }
 
+    fn renderWidget(self: *App, w: widget.Widget, win: vaxis.Window) !void {
+        switch (w.kind) {
+            .surface => |surf| {
+                if (self.surface) |*surface| {
+                    _ = surf;
+                    surface.render(win);
+                }
+            },
+            .text => |text| {
+                // Use a temporary arena for rendering this frame
+                var arena = std.heap.ArenaAllocator.init(self.allocator);
+                defer arena.deinit();
+                const alloc = arena.allocator();
+
+                var iter = widget.Text.Iterator{
+                    .text = text,
+                    .max_width = w.width,
+                    .allocator = alloc,
+                };
+
+                var row: usize = 0;
+                while (iter.next() catch null) |line| {
+                    var col: usize = 0;
+
+                    // Handle alignment
+                    const free_space = if (w.width > line.width) w.width - line.width else 0;
+                    const start_col: u16 = switch (text.@"align") {
+                        widget.Text.Align.left => 0,
+                        widget.Text.Align.center => free_space / 2,
+                        widget.Text.Align.right => free_space,
+                    };
+
+                    col = start_col;
+
+                    for (line.segments) |seg| {
+                        _ = win.printSegment(seg, .{ .row_offset = @intCast(row), .col_offset = @intCast(col) });
+                        col += vaxis.gwidth.gwidth(seg.text, .unicode);
+                    }
+                    row += 1;
+                }
+            },
+            .column => |col| {
+                for (col.children) |child| {
+                    const child_win = win.child(.{
+                        .x_off = child.x,
+                        .y_off = child.y,
+                        .width = child.width,
+                        .height = child.height,
+                    });
+                    try self.renderWidget(child, child_win);
+                }
+            },
+        }
+    }
+
     pub fn render(self: *App) !void {
         std.log.debug("render: starting render", .{});
 
@@ -795,14 +850,7 @@ pub const App = struct {
         var w = root_widget;
         _ = w.layout(constraints);
 
-        switch (w.kind) {
-            .surface => |surf| {
-                if (self.surface) |*surface| {
-                    _ = surf;
-                    surface.render(win);
-                }
-            },
-        }
+        try self.renderWidget(w, win);
 
         std.log.debug("render: calling vx.render()", .{});
         try self.vx.render(self.tty.writer());

@@ -13,11 +13,20 @@ function M.update(event)
 end
 
 function M.view()
+    local main_view
     if state.pty then
-        return prise.Surface({ pty = state.pty })
+        main_view = prise.Surface({ pty = state.pty })
+    else
+        main_view = prise.Surface({ pty = 1 })
     end
 
-    return prise.Surface({ pty = 1 })
+    return prise.Column({
+        main_view,
+        prise.Text({
+            text = " Prise Terminal ",
+            style = { bg = "white", fg = "black" },
+        }),
+    })
 end
 
 return M

@@ -170,6 +170,7 @@ test {
     _ = @import("client.zig");
     _ = @import("redraw.zig");
     _ = @import("Surface.zig");
+    _ = @import("widget.zig");
 
     if (builtin.os.tag.isDarwin() or builtin.os.tag.isBSD()) {
         _ = @import("io/kqueue.zig");
