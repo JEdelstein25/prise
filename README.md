@@ -16,6 +16,8 @@ using a third-party client.
 
 ## Vibe Coding
 
+![Vibe Coding](assets/vibe_coding.jpg)
+
 **Core Thesis**: High-performance software is the result of quality engineering.
 
 Prise is built on a solid foundation of `libghostty`, `libvaxis`, and Lua. While these tools provide an excellent starting point, they do not guarantee success—it is still entirely possible to build bad software with good tools. We believe that **vibe coding**—leveraging AI assistance to amplify engineering capabilities—is capable of consistently producing the quality software we demand.
