@@ -116,7 +116,7 @@ pub fn connectUnixSocket(
 
     _ = try loop.socket(
         posix.AF.UNIX,
-        posix.SOCK.STREAM | posix.SOCK.CLOEXEC,
+        posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK,
         0,
         .{
             .ptr = client,
@@ -1135,177 +1135,193 @@ pub const App = struct {
         const arena = app.msg_arena.allocator();
 
         switch (completion.result) {
-            .recv => |bytes_read| {
-                if (bytes_read == 0) {
+            .recv => |initial_bytes_read| {
+                if (initial_bytes_read == 0) {
                     std.log.info("Server closed connection", .{});
                     return;
                 }
 
-                // Append new data to message buffer
-                try app.msg_buffer.appendSlice(app.allocator, app.recv_buffer[0..bytes_read]);
+                var current_bytes_read = initial_bytes_read;
 
-                // Try to decode as many complete messages as possible
-                while (app.msg_buffer.items.len > 0) {
-                    const result = rpc.decodeMessageWithSize(arena, app.msg_buffer.items) catch |err| {
-                        if (err == error.UnexpectedEndOfInput) {
-                            // Partial message, wait for more data
-                            break;
+                while (true) {
+                    // Append new data to message buffer
+                    try app.msg_buffer.appendSlice(app.allocator, app.recv_buffer[0..current_bytes_read]);
+
+                    // Try to decode as many complete messages as possible
+                    while (app.msg_buffer.items.len > 0) {
+                        const result = rpc.decodeMessageWithSize(arena, app.msg_buffer.items) catch |err| {
+                            if (err == error.UnexpectedEndOfInput) {
+                                // Partial message, wait for more data
+                                break;
+                            }
+                            return err;
+                        };
+                        defer result.message.deinit(arena);
+
+                        const msg = result.message;
+                        const bytes_consumed = result.bytes_consumed;
+
+                        // Process message via ClientLogic
+                        const action = try ClientLogic.processServerMessage(&app.state, msg);
+
+                        switch (action) {
+                            .send_attach => |pty_id| {
+                                std.log.info("Sending attach_pty for session {}", .{pty_id});
+                                app.send_buffer = try msgpack.encode(app.allocator, .{ 0, @intFromEnum(MsgId.attach_pty), "attach_pty", .{pty_id} });
+                                _ = try l.send(app.fd, app.send_buffer.?, .{
+                                    .ptr = app,
+                                    .cb = onSendComplete,
+                                });
+                            },
+                            .redraw => |params| {
+                                app.handleRedraw(params) catch |err| {
+                                    std.log.err("Failed to handle redraw: {}", .{err});
+                                };
+                            },
+                            .attached => |id_i64| {
+                                std.log.info("Attached to session, checking for resize", .{});
+                                const pty_id = @as(u32, @intCast(id_i64));
+
+                                // Ensure surface exists
+                                if (!app.surfaces.contains(pty_id)) {
+                                    const ws = try vaxis.Tty.getWinsize(app.tty.fd);
+                                    std.log.info("Creating surface for attached session {}: {}x{}", .{ pty_id, ws.rows, ws.cols });
+                                    const surface = app.allocator.create(Surface) catch |err| {
+                                        std.log.err("Failed to allocate surface: {}", .{err});
+                                        return error.SurfaceInitFailed;
+                                    };
+                                    surface.* = Surface.init(app.allocator, pty_id, ws.rows, ws.cols) catch |err| {
+                                        std.log.err("Failed to create surface: {}", .{err});
+                                        app.allocator.destroy(surface);
+                                        return error.SurfaceInitFailed;
+                                    };
+                                    app.surfaces.put(pty_id, surface) catch |err| {
+                                        std.log.err("Failed to store surface: {}", .{err});
+                                        surface.deinit();
+                                        app.allocator.destroy(surface);
+                                        return error.SurfaceInitFailed;
+                                    };
+                                }
+
+                                if (app.surfaces.get(pty_id)) |surface| {
+                                    std.log.info("Updating UI with pty_attach for {}", .{pty_id});
+                                    // Send pty_attach event to Lua UI
+                                    app.ui.update(.{
+                                        .pty_attach = .{
+                                            .id = pty_id,
+                                            .surface = surface,
+                                            .app = app,
+                                            .send_key_fn = struct {
+                                                fn appSendDirect(ctx: *anyopaque, id: u32, key: lua_event.KeyData) anyerror!void {
+                                                    const self: *App = @ptrCast(@alignCast(ctx));
+
+                                                    var key_map_kv = try self.allocator.alloc(msgpack.Value.KeyValue, 5);
+                                                    key_map_kv[0] = .{ .key = .{ .string = "key" }, .value = .{ .string = key.key } };
+                                                    key_map_kv[1] = .{ .key = .{ .string = "shiftKey" }, .value = .{ .boolean = key.shift } };
+                                                    key_map_kv[2] = .{ .key = .{ .string = "ctrlKey" }, .value = .{ .boolean = key.ctrl } };
+                                                    key_map_kv[3] = .{ .key = .{ .string = "altKey" }, .value = .{ .boolean = key.alt } };
+                                                    key_map_kv[4] = .{ .key = .{ .string = "metaKey" }, .value = .{ .boolean = key.super } };
+
+                                                    const key_map_val = msgpack.Value{ .map = key_map_kv };
+
+                                                    var params = try self.allocator.alloc(msgpack.Value, 2);
+                                                    params[0] = .{ .unsigned = @intCast(id) };
+                                                    params[1] = key_map_val;
+
+                                                    var arr = try self.allocator.alloc(msgpack.Value, 3);
+                                                    arr[0] = .{ .unsigned = 2 }; // notification
+                                                    arr[1] = .{ .string = "key_input" };
+                                                    arr[2] = .{ .array = params };
+
+                                                    const encoded_msg = try msgpack.encodeFromValue(self.allocator, .{ .array = arr });
+                                                    defer self.allocator.free(encoded_msg);
+
+                                                    // Clean up msgpack structures
+                                                    self.allocator.free(arr);
+                                                    self.allocator.free(params);
+                                                    self.allocator.free(key_map_kv);
+
+                                                    try self.sendDirect(encoded_msg);
+                                                }
+                                            }.appSendDirect,
+                                            .send_mouse_fn = struct {
+                                                fn appSendMouse(ctx: *anyopaque, id: u32, mouse: lua_event.MouseData) anyerror!void {
+                                                    const self: *App = @ptrCast(@alignCast(ctx));
+
+                                                    var mouse_map_kv = try self.allocator.alloc(msgpack.Value.KeyValue, 7);
+                                                    mouse_map_kv[0] = .{ .key = .{ .string = "col" }, .value = .{ .unsigned = mouse.col } };
+                                                    mouse_map_kv[1] = .{ .key = .{ .string = "row" }, .value = .{ .unsigned = mouse.row } };
+                                                    mouse_map_kv[2] = .{ .key = .{ .string = "button" }, .value = .{ .string = mouse.button } };
+                                                    mouse_map_kv[3] = .{ .key = .{ .string = "event_type" }, .value = .{ .string = mouse.event_type } };
+                                                    mouse_map_kv[4] = .{ .key = .{ .string = "shiftKey" }, .value = .{ .boolean = mouse.shift } };
+                                                    mouse_map_kv[5] = .{ .key = .{ .string = "ctrlKey" }, .value = .{ .boolean = mouse.ctrl } };
+                                                    mouse_map_kv[6] = .{ .key = .{ .string = "altKey" }, .value = .{ .boolean = mouse.alt } };
+
+                                                    const mouse_map_val = msgpack.Value{ .map = mouse_map_kv };
+
+                                                    var params = try self.allocator.alloc(msgpack.Value, 2);
+                                                    params[0] = .{ .unsigned = @intCast(id) };
+                                                    params[1] = mouse_map_val;
+
+                                                    var arr = try self.allocator.alloc(msgpack.Value, 3);
+                                                    arr[0] = .{ .unsigned = 2 }; // notification
+                                                    arr[1] = .{ .string = "mouse_input" };
+                                                    arr[2] = .{ .array = params };
+
+                                                    const encoded_msg = try msgpack.encodeFromValue(self.allocator, .{ .array = arr });
+                                                    defer self.allocator.free(encoded_msg);
+
+                                                    // Clean up msgpack structures
+                                                    self.allocator.free(arr);
+                                                    self.allocator.free(params);
+                                                    self.allocator.free(mouse_map_kv);
+
+                                                    try self.sendDirect(encoded_msg);
+                                                }
+                                            }.appSendMouse,
+                                        },
+                                    }) catch |err| {
+                                        std.log.err("Failed to update UI with pty_attach: {}", .{err});
+                                    };
+
+                                    std.log.info("Sending initial resize: {}x{}", .{ surface.rows, surface.cols });
+                                    const width_px = @as(u16, surface.cols) * app.cell_width_px;
+                                    const height_px = @as(u16, surface.rows) * app.cell_height_px;
+                                    const resize_msg = try msgpack.encode(app.allocator, .{
+                                        2, // notification
+                                        "resize_pty",
+                                        .{ pty_id, surface.rows, surface.cols, width_px, height_px },
+                                    });
+                                    defer app.allocator.free(resize_msg);
+                                    try app.sendDirect(resize_msg);
+                                }
+                            },
+                            .pty_exited => |info| {
+                                std.log.info("PTY {} exited with status {}", .{ info.pty_id, info.status });
+                                app.ui.update(.{ .pty_exited = .{ .id = info.pty_id, .status = info.status } }) catch |err| {
+                                    std.log.err("Failed to update UI with pty_exited: {}", .{err});
+                                };
+                            },
+                            .none => {},
                         }
+
+                        // Remove consumed bytes from buffer
+                        if (bytes_consumed > 0) {
+                            try app.msg_buffer.replaceRange(app.allocator, 0, bytes_consumed, &.{});
+                        }
+                    }
+
+                    // Try to read more
+                    const n = posix.recv(app.fd, &app.recv_buffer, 0) catch |err| {
+                        if (err == error.WouldBlock) break;
                         return err;
                     };
-                    defer result.message.deinit(arena);
 
-                    const msg = result.message;
-                    const bytes_consumed = result.bytes_consumed;
-
-                    // Process message via ClientLogic
-                    const action = try ClientLogic.processServerMessage(&app.state, msg);
-
-                    switch (action) {
-                        .send_attach => |pty_id| {
-                            std.log.info("Sending attach_pty for session {}", .{pty_id});
-                            app.send_buffer = try msgpack.encode(app.allocator, .{ 0, @intFromEnum(MsgId.attach_pty), "attach_pty", .{pty_id} });
-                            _ = try l.send(app.fd, app.send_buffer.?, .{
-                                .ptr = app,
-                                .cb = onSendComplete,
-                            });
-                        },
-                        .redraw => |params| {
-                            app.handleRedraw(params) catch |err| {
-                                std.log.err("Failed to handle redraw: {}", .{err});
-                            };
-                        },
-                        .attached => |id_i64| {
-                            std.log.info("Attached to session, checking for resize", .{});
-                            const pty_id = @as(u32, @intCast(id_i64));
-
-                            // Ensure surface exists
-                            if (!app.surfaces.contains(pty_id)) {
-                                const ws = try vaxis.Tty.getWinsize(app.tty.fd);
-                                std.log.info("Creating surface for attached session {}: {}x{}", .{ pty_id, ws.rows, ws.cols });
-                                const surface = app.allocator.create(Surface) catch |err| {
-                                    std.log.err("Failed to allocate surface: {}", .{err});
-                                    return error.SurfaceInitFailed;
-                                };
-                                surface.* = Surface.init(app.allocator, pty_id, ws.rows, ws.cols) catch |err| {
-                                    std.log.err("Failed to create surface: {}", .{err});
-                                    app.allocator.destroy(surface);
-                                    return error.SurfaceInitFailed;
-                                };
-                                app.surfaces.put(pty_id, surface) catch |err| {
-                                    std.log.err("Failed to store surface: {}", .{err});
-                                    surface.deinit();
-                                    app.allocator.destroy(surface);
-                                    return error.SurfaceInitFailed;
-                                };
-                            }
-
-                            if (app.surfaces.get(pty_id)) |surface| {
-                                std.log.info("Updating UI with pty_attach for {}", .{pty_id});
-                                // Send pty_attach event to Lua UI
-                                app.ui.update(.{
-                                    .pty_attach = .{
-                                        .id = pty_id,
-                                        .surface = surface,
-                                        .app = app,
-                                        .send_key_fn = struct {
-                                            fn appSendDirect(ctx: *anyopaque, id: u32, key: lua_event.KeyData) anyerror!void {
-                                                const self: *App = @ptrCast(@alignCast(ctx));
-
-                                                var key_map_kv = try self.allocator.alloc(msgpack.Value.KeyValue, 5);
-                                                key_map_kv[0] = .{ .key = .{ .string = "key" }, .value = .{ .string = key.key } };
-                                                key_map_kv[1] = .{ .key = .{ .string = "shiftKey" }, .value = .{ .boolean = key.shift } };
-                                                key_map_kv[2] = .{ .key = .{ .string = "ctrlKey" }, .value = .{ .boolean = key.ctrl } };
-                                                key_map_kv[3] = .{ .key = .{ .string = "altKey" }, .value = .{ .boolean = key.alt } };
-                                                key_map_kv[4] = .{ .key = .{ .string = "metaKey" }, .value = .{ .boolean = key.super } };
-
-                                                const key_map_val = msgpack.Value{ .map = key_map_kv };
-
-                                                var params = try self.allocator.alloc(msgpack.Value, 2);
-                                                params[0] = .{ .unsigned = @intCast(id) };
-                                                params[1] = key_map_val;
-
-                                                var arr = try self.allocator.alloc(msgpack.Value, 3);
-                                                arr[0] = .{ .unsigned = 2 }; // notification
-                                                arr[1] = .{ .string = "key_input" };
-                                                arr[2] = .{ .array = params };
-
-                                                const encoded_msg = try msgpack.encodeFromValue(self.allocator, .{ .array = arr });
-                                                defer self.allocator.free(encoded_msg);
-
-                                                // Clean up msgpack structures
-                                                self.allocator.free(arr);
-                                                self.allocator.free(params);
-                                                self.allocator.free(key_map_kv);
-
-                                                try self.sendDirect(encoded_msg);
-                                            }
-                                        }.appSendDirect,
-                                        .send_mouse_fn = struct {
-                                            fn appSendMouse(ctx: *anyopaque, id: u32, mouse: lua_event.MouseData) anyerror!void {
-                                                const self: *App = @ptrCast(@alignCast(ctx));
-
-                                                var mouse_map_kv = try self.allocator.alloc(msgpack.Value.KeyValue, 7);
-                                                mouse_map_kv[0] = .{ .key = .{ .string = "col" }, .value = .{ .unsigned = mouse.col } };
-                                                mouse_map_kv[1] = .{ .key = .{ .string = "row" }, .value = .{ .unsigned = mouse.row } };
-                                                mouse_map_kv[2] = .{ .key = .{ .string = "button" }, .value = .{ .string = mouse.button } };
-                                                mouse_map_kv[3] = .{ .key = .{ .string = "event_type" }, .value = .{ .string = mouse.event_type } };
-                                                mouse_map_kv[4] = .{ .key = .{ .string = "shiftKey" }, .value = .{ .boolean = mouse.shift } };
-                                                mouse_map_kv[5] = .{ .key = .{ .string = "ctrlKey" }, .value = .{ .boolean = mouse.ctrl } };
-                                                mouse_map_kv[6] = .{ .key = .{ .string = "altKey" }, .value = .{ .boolean = mouse.alt } };
-
-                                                const mouse_map_val = msgpack.Value{ .map = mouse_map_kv };
-
-                                                var params = try self.allocator.alloc(msgpack.Value, 2);
-                                                params[0] = .{ .unsigned = @intCast(id) };
-                                                params[1] = mouse_map_val;
-
-                                                var arr = try self.allocator.alloc(msgpack.Value, 3);
-                                                arr[0] = .{ .unsigned = 2 }; // notification
-                                                arr[1] = .{ .string = "mouse_input" };
-                                                arr[2] = .{ .array = params };
-
-                                                const encoded_msg = try msgpack.encodeFromValue(self.allocator, .{ .array = arr });
-                                                defer self.allocator.free(encoded_msg);
-
-                                                // Clean up msgpack structures
-                                                self.allocator.free(arr);
-                                                self.allocator.free(params);
-                                                self.allocator.free(mouse_map_kv);
-
-                                                try self.sendDirect(encoded_msg);
-                                            }
-                                        }.appSendMouse,
-                                    },
-                                }) catch |err| {
-                                    std.log.err("Failed to update UI with pty_attach: {}", .{err});
-                                };
-
-                                std.log.info("Sending initial resize: {}x{}", .{ surface.rows, surface.cols });
-                                const width_px = @as(u16, surface.cols) * app.cell_width_px;
-                                const height_px = @as(u16, surface.rows) * app.cell_height_px;
-                                const resize_msg = try msgpack.encode(app.allocator, .{
-                                    2, // notification
-                                    "resize_pty",
-                                    .{ pty_id, surface.rows, surface.cols, width_px, height_px },
-                                });
-                                defer app.allocator.free(resize_msg);
-                                try app.sendDirect(resize_msg);
-                            }
-                        },
-                        .pty_exited => |info| {
-                            std.log.info("PTY {} exited with status {}", .{ info.pty_id, info.status });
-                            app.ui.update(.{ .pty_exited = .{ .id = info.pty_id, .status = info.status } }) catch |err| {
-                                std.log.err("Failed to update UI with pty_exited: {}", .{err});
-                            };
-                        },
-                        .none => {},
+                    if (n == 0) {
+                        std.log.info("Server closed connection", .{});
+                        return;
                     }
-
-                    // Remove consumed bytes from buffer
-                    if (bytes_consumed > 0) {
-                        try app.msg_buffer.replaceRange(app.allocator, 0, bytes_consumed, &.{});
-                    }
+                    current_bytes_read = n;
                 }
 
                 // Keep receiving unless we're quitting

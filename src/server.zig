@@ -341,7 +341,8 @@ const ScreenState = struct {
 
         // Determine effective mode based on dirty flags
         var effective_mode = mode;
-        if (rs.dirty == .full) effective_mode = .full;
+        const rs_was_full = (rs.dirty == .full);
+        if (rs_was_full) effective_mode = .full;
         rs.dirty = .false;
 
         const rows = rs.rows;
@@ -494,13 +495,15 @@ const ScreenState = struct {
                     }
 
                     if (cluster.len > 0) {
-                        var utf8_list = std.ArrayList(u8).empty;
-                        defer utf8_list.deinit(arena_allocator);
+                        var stack_buf: [64]u8 = undefined;
+                        var stack_len: usize = 0;
                         for (cluster) |cp| {
+                            if (stack_len + 4 > stack_buf.len) break;
                             const len = std.unicode.utf8Encode(cp, &utf8_buf) catch continue;
-                            try utf8_list.appendSlice(arena_allocator, utf8_buf[0..len]);
+                            @memcpy(stack_buf[stack_len..][0..len], utf8_buf[0..len]);
+                            stack_len += len;
                         }
-                        text = try utf8_list.toOwnedSlice(arena_allocator);
+                        text = try arena_allocator.dupe(u8, stack_buf[0..stack_len]);
                     } else {
                         text = try arena_allocator.dupe(u8, " ");
                     }
@@ -521,7 +524,7 @@ const ScreenState = struct {
         const update_us = @divTrunc(t1 - t0, std.time.ns_per_us);
         const build_us = @divTrunc(t2 - t1, std.time.ns_per_us);
 
-        std.log.info("ScreenState.init: mode={s} dirty_rows={}/{} update={}us build={}us", .{ if (effective_mode == .full) "full" else "incremental", dirty_row_count, rows, update_us, build_us });
+        std.log.info("ScreenState.init: mode={s} rs_full={} dirty_rows={}/{} update={}us build={}us", .{ if (effective_mode == .full) "full" else "incremental", rs_was_full, dirty_row_count, rows, update_us, build_us });
 
         return ScreenState{
             .rows = @intCast(rows),
