@@ -8,6 +8,7 @@ const vaxis_helper = @import("vaxis_helper.zig");
 pub const Event = union(enum) {
     vaxis: vaxis.Event,
     mouse: MouseEvent,
+    split_resize: SplitResizeEvent,
     pty_attach: struct {
         id: u32,
         surface: *Surface,
@@ -20,6 +21,12 @@ pub const Event = union(enum) {
         status: u32,
     },
     init: void,
+};
+
+pub const SplitResizeEvent = struct {
+    parent_id: ?u32,
+    child_index: u16,
+    ratio: f32,
 };
 
 pub const MouseEvent = struct {
@@ -103,6 +110,26 @@ pub fn pushEvent(lua: *ziglua.Lua, event: Event) !void {
             lua.setField(-2, "id");
             lua.pushInteger(@intCast(info.status));
             lua.setField(-2, "status");
+            lua.setField(-2, "data");
+        },
+
+        .split_resize => |sr| {
+            _ = lua.pushString("split_resize");
+            lua.setField(-2, "type");
+
+            lua.createTable(0, 3);
+
+            if (sr.parent_id) |pid| {
+                lua.pushInteger(@intCast(pid));
+                lua.setField(-2, "parent_id");
+            }
+
+            lua.pushInteger(@intCast(sr.child_index));
+            lua.setField(-2, "child_index");
+
+            lua.pushNumber(@floatCast(sr.ratio));
+            lua.setField(-2, "ratio");
+
             lua.setField(-2, "data");
         },
 

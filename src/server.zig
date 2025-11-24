@@ -1004,12 +1004,15 @@ const Client = struct {
                         }
 
                         if (self.server.ptys.get(session_id)) |pty_instance| {
-                            // Always resize if we get an event, as pixel dimensions might have changed even if rows/cols didn't?
-                            // But usually we check rows/cols match.
-                            // Let's keep the optimization but check pixels too if they are non-zero?
-                            // Ghostty internal terminal doesn't store pixel size directly in public fields easily?
-                            // It stores cols/rows.
-                            // But we should update PTY size with pixels.
+                            std.log.info("resize_pty: session={} requested={}x{} ({}x{}px) current_terminal={}x{}", .{
+                                session_id,
+                                cols,
+                                rows,
+                                x_pixel,
+                                y_pixel,
+                                pty_instance.terminal.cols,
+                                pty_instance.terminal.rows,
+                            });
 
                             const size: pty.winsize = .{
                                 .ws_row = rows,
@@ -1025,6 +1028,12 @@ const Client = struct {
                             // Also resize the terminal state
                             pty_instance.terminal_mutex.lock();
                             if (pty_instance.terminal.rows != rows or pty_instance.terminal.cols != cols) {
+                                std.log.info("resize_pty: resizing terminal from {}x{} to {}x{}", .{
+                                    pty_instance.terminal.cols,
+                                    pty_instance.terminal.rows,
+                                    cols,
+                                    rows,
+                                });
                                 pty_instance.terminal.resize(
                                     pty_instance.allocator,
                                     cols,
@@ -1038,7 +1047,9 @@ const Client = struct {
                             pty_instance.terminal.height_px = y_pixel;
 
                             // Send in-band size report if mode 2048 is enabled
-                            if (pty_instance.terminal.modes.get(.in_band_size_reports)) {
+                            const in_band_enabled = pty_instance.terminal.modes.get(.in_band_size_reports);
+                            std.log.info("resize_pty: in_band_size_reports mode={}", .{in_band_enabled});
+                            if (in_band_enabled) {
                                 var report_buf: [64]u8 = undefined;
                                 const report = std.fmt.bufPrint(&report_buf, "\x1b[48;{};{};{};{}t", .{
                                     rows,
@@ -1046,11 +1057,18 @@ const Client = struct {
                                     y_pixel,
                                     x_pixel,
                                 }) catch unreachable;
+                                std.log.info("resize_pty: sending in-band report: {s}", .{report});
                                 _ = posix.write(pty_instance.process.master, report) catch |err| {
                                     std.log.err("Failed to send in-band size report: {}", .{err});
                                 };
                             }
+
+                            // Mark render state as needing full redraw after resize
+                            // Don't send immediate redraw - let the application respond to SIGWINCH first
+                            // The normal PTY dirty handling will send updates after the app redraws
+                            pty_instance.render_state.dirty = .full;
                             pty_instance.terminal_mutex.unlock();
+                            std.log.info("resize_pty: completed for session={}", .{session_id});
                         } else {
                             std.log.warn("resize_pty notification: session {} not found", .{session_id});
                         }
@@ -1332,6 +1350,16 @@ const Server = struct {
                 return msgpack.Value{ .string = try self.allocator.dupe(u8, "session not found") };
             };
 
+            std.log.info("resize_pty request: session={} requested={}x{} ({}x{}px) current={}x{}", .{
+                session_id,
+                cols,
+                rows,
+                x_pixel,
+                y_pixel,
+                pty_instance.terminal.cols,
+                pty_instance.terminal.rows,
+            });
+
             // Update PTY size including pixels
             const size: pty.winsize = .{
                 .ws_row = rows,
@@ -1347,8 +1375,14 @@ const Server = struct {
             };
 
             // Also resize the terminal state if grid dimensions changed
+            pty_instance.terminal_mutex.lock();
             if (pty_instance.terminal.rows != rows or pty_instance.terminal.cols != cols) {
-                pty_instance.terminal_mutex.lock();
+                std.log.info("resize_pty request: resizing terminal from {}x{} to {}x{}", .{
+                    pty_instance.terminal.cols,
+                    pty_instance.terminal.rows,
+                    cols,
+                    rows,
+                });
                 pty_instance.terminal.resize(
                     pty_instance.allocator,
                     cols,
@@ -1356,10 +1390,34 @@ const Server = struct {
                 ) catch |err| {
                     std.log.err("Resize terminal failed: {}", .{err});
                 };
-                pty_instance.terminal_mutex.unlock();
             }
 
-            std.log.info("Resized session {} to {}x{} ({}x{}px)", .{ session_id, rows, cols, x_pixel, y_pixel });
+            // Update pixel dimensions for mouse encoding
+            pty_instance.terminal.width_px = x_pixel;
+            pty_instance.terminal.height_px = y_pixel;
+
+            // Send in-band size report if mode 2048 is enabled
+            const in_band_enabled = pty_instance.terminal.modes.get(.in_band_size_reports);
+            std.log.info("resize_pty request: in_band_size_reports mode={}", .{in_band_enabled});
+            if (in_band_enabled) {
+                var report_buf: [64]u8 = undefined;
+                const report = std.fmt.bufPrint(&report_buf, "\x1b[48;{};{};{};{}t", .{
+                    rows,
+                    cols,
+                    y_pixel,
+                    x_pixel,
+                }) catch unreachable;
+                std.log.info("resize_pty request: sending in-band report", .{});
+                _ = posix.write(pty_instance.process.master, report) catch |err| {
+                    std.log.err("Failed to send in-band size report: {}", .{err});
+                };
+            }
+
+            // Mark render state as needing full redraw after resize
+            pty_instance.render_state.dirty = .full;
+            pty_instance.terminal_mutex.unlock();
+
+            std.log.info("Resized session {} to {}x{} ({}x{}px)", .{ session_id, cols, rows, x_pixel, y_pixel });
             return msgpack.Value.nil;
         } else if (std.mem.eql(u8, method, "detach_pty")) {
             const args = parseDetachPtyParams(params) catch {

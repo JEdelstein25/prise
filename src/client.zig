@@ -386,6 +386,12 @@ pub const ClientLogic = struct {
     }
 };
 
+pub const DragState = struct {
+    handle: widget.SplitHandle,
+    start_x: f64,
+    start_y: f64,
+};
+
 pub const App = struct {
     connected: bool = false,
     fd: posix.fd_t = undefined,
@@ -416,6 +422,10 @@ pub const App = struct {
 
     // Hit regions for mouse event targeting
     hit_regions: []widget.HitRegion = &.{},
+    split_handles: []widget.SplitHandle = &.{},
+
+    // Drag state for split resizing
+    drag_state: ?DragState = null,
 
     pipe_read_fd: posix.fd_t = undefined,
     pipe_write_fd: posix.fd_t = undefined,
@@ -714,41 +724,107 @@ pub const App = struct {
             const x: f64 = @as(f64, @floatFromInt(mouse.col)) / cell_w;
             const y: f64 = @as(f64, @floatFromInt(mouse.row)) / cell_h;
 
-            const target = widget.hitTest(self.hit_regions, x, y);
-            var target_x: ?f64 = null;
-            var target_y: ?f64 = null;
+            // Handle ongoing drag
+            if (self.drag_state) |*drag| {
+                if (mouse.type == .release) {
+                    // End drag - calculate final ratio and send to Lua
+                    const mouse_pos = switch (drag.handle.axis) {
+                        .horizontal => x,
+                        .vertical => y,
+                    };
+                    const new_ratio = drag.handle.calculateNewRatio(mouse_pos);
 
-            if (target) |pty_id| {
-                if (widget.findRegion(self.hit_regions, pty_id)) |region| {
-                    target_x = x - @as(f64, @floatFromInt(region.x));
-                    target_y = y - @as(f64, @floatFromInt(region.y));
+                    self.ui.update(.{ .split_resize = .{
+                        .parent_id = drag.handle.parent_id,
+                        .child_index = drag.handle.child_index,
+                        .ratio = new_ratio,
+                    } }) catch |err| {
+                        if (err != error.NoUpdateFunction) {
+                            std.log.err("Lua UI update failed: {}", .{err});
+                        }
+                    };
+
+                    self.drag_state = null;
+                    self.vx.setMouseShape(.default);
+                } else if (mouse.type == .drag) {
+                    // Continue drag - update ratio
+                    const mouse_pos = switch (drag.handle.axis) {
+                        .horizontal => x,
+                        .vertical => y,
+                    };
+                    const new_ratio = drag.handle.calculateNewRatio(mouse_pos);
+
+                    self.ui.update(.{ .split_resize = .{
+                        .parent_id = drag.handle.parent_id,
+                        .child_index = drag.handle.child_index,
+                        .ratio = new_ratio,
+                    } }) catch |err| {
+                        if (err != error.NoUpdateFunction) {
+                            std.log.err("Lua UI update failed: {}", .{err});
+                        }
+                    };
                 }
-                // Update mouse cursor shape based on target PTY's mouse_shape
-                if (self.surfaces.get(pty_id)) |surface| {
-                    const vaxis_shape = mapMouseShapeToVaxis(surface.mouse_shape);
-                    self.vx.setMouseShape(vaxis_shape);
-                }
-            } else {
-                // No target - reset to default
-                self.vx.setMouseShape(.default);
+                return;
             }
 
-            const mouse_event = lua_event.MouseEvent{
-                .x = x,
-                .y = y,
-                .button = mouse.button,
-                .action = mouse.type,
-                .mods = mouse.mods,
-                .target = target,
-                .target_x = target_x,
-                .target_y = target_y,
-            };
-
-            self.ui.update(.{ .mouse = mouse_event }) catch |err| {
-                if (err != error.NoUpdateFunction) {
-                    std.log.err("Lua UI update failed: {}", .{err});
+            // Check if hovering over a split handle
+            if (widget.hitTestSplitHandle(self.split_handles, x, y)) |handle| {
+                // Start drag on press
+                if (mouse.type == .press and mouse.button == .left) {
+                    self.drag_state = .{
+                        .handle = handle.*,
+                        .start_x = x,
+                        .start_y = y,
+                    };
                 }
-            };
+
+                // Set cursor shape based on axis
+                switch (handle.axis) {
+                    .horizontal => self.vx.setMouseShape(.@"ew-resize"),
+                    .vertical => self.vx.setMouseShape(.@"ns-resize"),
+                }
+                try self.scheduleRender();
+                return;
+            } else {
+                // Not on a split handle
+                const target = widget.hitTest(self.hit_regions, x, y);
+                var target_x: ?f64 = null;
+                var target_y: ?f64 = null;
+
+                if (target) |pty_id| {
+                    if (widget.findRegion(self.hit_regions, pty_id)) |region| {
+                        target_x = x - @as(f64, @floatFromInt(region.x));
+                        target_y = y - @as(f64, @floatFromInt(region.y));
+                    }
+                    // Update mouse cursor shape based on target PTY's mouse_shape
+                    if (self.surfaces.get(pty_id)) |surface| {
+                        const vaxis_shape = mapMouseShapeToVaxis(surface.mouse_shape);
+                        self.vx.setMouseShape(vaxis_shape);
+                        try self.scheduleRender();
+                    }
+                } else {
+                    // No target - reset to default
+                    self.vx.setMouseShape(.default);
+                    try self.scheduleRender();
+                }
+
+                const mouse_event = lua_event.MouseEvent{
+                    .x = x,
+                    .y = y,
+                    .button = mouse.button,
+                    .action = mouse.type,
+                    .mods = mouse.mods,
+                    .target = target,
+                    .target_x = target_x,
+                    .target_y = target_y,
+                };
+
+                self.ui.update(.{ .mouse = mouse_event }) catch |err| {
+                    if (err != error.NoUpdateFunction) {
+                        std.log.err("Lua UI update failed: {}", .{err});
+                    }
+                };
+            }
             return;
         }
 
@@ -979,7 +1055,15 @@ pub const App = struct {
             .surface => |surf| {
                 if (self.surfaces.get(surf.pty_id)) |surface| {
                     // Check if we need to resize the PTY
+                    std.log.debug("renderWidget surface: pty={} widget={}x{} surface={}x{}", .{
+                        surf.pty_id,
+                        w.width,
+                        w.height,
+                        surface.cols,
+                        surface.rows,
+                    });
                     if (w.width != surface.cols or w.height != surface.rows) {
+                        std.log.info("renderWidget: size mismatch for pty={}, sending resize", .{surf.pty_id});
                         self.sendResize(surf.pty_id, w.height, w.width) catch |err| {
                             std.log.err("Failed to send resize: {}", .{err});
                         };
@@ -1122,6 +1206,12 @@ pub const App = struct {
             self.allocator.free(self.hit_regions);
         }
         self.hit_regions = w.collectHitRegions(self.allocator, 0, 0) catch &.{};
+
+        // Collect split handles for resize drag detection
+        if (self.split_handles.len > 0) {
+            self.allocator.free(self.split_handles);
+        }
+        self.split_handles = w.collectSplitHandles(self.allocator, 0, 0) catch &.{};
 
         try self.renderWidget(w, win);
 

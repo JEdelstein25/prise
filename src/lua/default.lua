@@ -7,12 +7,12 @@ local state = {
     pending_command = false,
     timer = nil,
     pending_split = nil,
+    next_split_id = 1,
 }
 
 local M = {}
 
-local DEFAULT_FLEX = 10000
-local RESIZE_STEP = 5
+local RESIZE_STEP = 0.05 -- 5% step for keyboard resize
 
 -- --- Helpers ---
 
@@ -80,13 +80,16 @@ local function insert_split_recursive(node, target_id, new_pane, direction)
     if is_pane(node) then
         if node.id == target_id then
             -- Found the target pane. Replace it with a split containing [node, new_pane]
-            local split_flex = node.flex or DEFAULT_FLEX
-            node.flex = DEFAULT_FLEX
-            new_pane.flex = DEFAULT_FLEX
+            local split_ratio = node.ratio -- Inherit ratio from the pane being replaced
+            node.ratio = nil -- Children start with nil (equal split)
+            new_pane.ratio = nil
+            local split_id = state.next_split_id
+            state.next_split_id = state.next_split_id + 1
             return {
                 type = "split",
+                split_id = split_id,
                 direction = direction,
-                flex = split_flex, -- Inherit flex from the pane being replaced
+                ratio = split_ratio,
                 children = { node, new_pane },
             }
         else
@@ -155,7 +158,7 @@ local function remove_pane_recursive(node, id)
         -- If only one child remains, promote it
         if #new_children == 1 then
             local survivor = new_children[1]
-            survivor.flex = node.flex or DEFAULT_FLEX
+            survivor.ratio = node.ratio -- Inherit ratio from parent
             return survivor, closest_id
         end
 
@@ -176,7 +179,7 @@ local function get_focused_pty()
     return nil
 end
 
-local function resize_pane(dimension, delta_chars)
+local function resize_pane(dimension, delta_ratio)
     if not state.focused_id or not state.root then
         return
     end
@@ -209,88 +212,24 @@ local function resize_pane(dimension, delta_chars)
         end
     end
 
-    if not parent_split or not child_idx then
+    if not parent_split or not child_idx or child_idx ~= 1 then
+        -- Only resize first child (sets the split ratio)
         return
     end
 
-    -- Calculate flex delta
-    local pty = get_focused_pty()
-    if not pty then
-        return
+    -- Get current ratio (nil means 0.5)
+    local current_ratio = node.ratio or 0.5
+    local new_ratio = current_ratio + delta_ratio
+
+    -- Clamp to valid range
+    if new_ratio < 0.1 then
+        new_ratio = 0.1
+    end
+    if new_ratio > 0.9 then
+        new_ratio = 0.9
     end
 
-    local size = pty:size()
-    local current_dim_size = (dimension == "width") and size.cols or size.rows
-    local current_flex = node.flex or DEFAULT_FLEX
-
-    if current_dim_size == 0 then
-        return
-    end
-
-    local flex_per_char = current_flex / current_dim_size
-    local flex_delta = math.floor(delta_chars * flex_per_char)
-
-    if flex_delta == 0 then
-        -- Ensure at least some movement if delta_chars is small
-        flex_delta = (delta_chars > 0) and 100 or -100
-    end
-
-    -- Resize logic:
-    -- To grow (positive delta): try to shrink next sibling, else shrink prev sibling.
-    -- To shrink (negative delta): try to grow next sibling, else grow prev sibling.
-
-    local neighbor = nil
-    local neighbor_idx = nil
-
-    if delta_chars > 0 then
-        -- Grow
-        if child_idx < #parent_split.children then
-            neighbor_idx = child_idx + 1
-        elseif child_idx > 1 then
-            neighbor_idx = child_idx - 1
-        end
-    else
-        -- Shrink
-        if child_idx < #parent_split.children then
-            neighbor_idx = child_idx + 1
-        elseif child_idx > 1 then
-            neighbor_idx = child_idx - 1
-        end
-    end
-
-    if not neighbor_idx then
-        return
-    end
-    neighbor = parent_split.children[neighbor_idx]
-
-    -- Apply flex change
-    -- If we grow, neighbor shrinks. If we shrink, neighbor grows.
-    -- Wait, if we take from neighbor (grow), neighbor flex decreases.
-    -- But if neighbor is to the left or right, does it matter?
-    -- Flex is just ratio. Increasing my flex vs neighbor flex increases my size.
-
-    -- So:
-    -- My flex += flex_delta (can be negative)
-    -- Neighbor flex -= flex_delta
-
-    local my_new_flex = (node.flex or DEFAULT_FLEX) + flex_delta
-    local neighbor_new_flex = (neighbor.flex or DEFAULT_FLEX) - flex_delta
-
-    -- Clamp values (don't let them disappear completely, keep at least small flex)
-    local min_flex = 100
-    if my_new_flex < min_flex then
-        local diff = min_flex - my_new_flex
-        my_new_flex = min_flex
-        neighbor_new_flex = neighbor_new_flex - diff
-    end
-    if neighbor_new_flex < min_flex then
-        local diff = min_flex - neighbor_new_flex
-        neighbor_new_flex = min_flex
-        my_new_flex = my_new_flex - diff
-    end
-
-    node.flex = math.floor(my_new_flex)
-    neighbor.flex = math.floor(neighbor_new_flex)
+    node.ratio = new_ratio
 
     prise.request_frame()
 end
@@ -364,7 +303,7 @@ function M.update(event)
     if event.type == "pty_attach" then
         prise.log.info("Lua: pty_attach received")
         local pty = event.data.pty
-        local new_pane = { type = "pane", pty = pty, id = pty:id(), flex = DEFAULT_FLEX }
+        local new_pane = { type = "pane", pty = pty, id = pty:id() }
 
         if not state.root then
             -- First terminal
@@ -386,10 +325,12 @@ function M.update(event)
                 if is_split(state.root) then
                     table.insert(state.root.children, new_pane)
                 else
+                    local split_id = state.next_split_id
+                    state.next_split_id = state.next_split_id + 1
                     state.root = {
                         type = "split",
+                        split_id = split_id,
                         direction = direction,
-                        flex = DEFAULT_FLEX,
                         children = { state.root, new_pane },
                     }
                 end
@@ -539,6 +480,38 @@ function M.update(event)
         end
     elseif event.type == "winsize" then
         prise.request_frame()
+    elseif event.type == "split_resize" then
+        -- Handle mouse drag resize
+        local d = event.data
+        local split_id = d.parent_id
+        local child_index = d.child_index
+        local new_ratio = d.ratio
+
+        -- Find the split by id and update the child's ratio
+        local function update_split_ratio(node)
+            if not node then
+                return false
+            end
+            if is_split(node) then
+                if node.split_id == split_id then
+                    -- Found it - update the first child's ratio
+                    if node.children[child_index + 1] then
+                        node.children[child_index + 1].ratio = new_ratio
+                    end
+                    return true
+                end
+                for _, child in ipairs(node.children) do
+                    if update_split_ratio(child) then
+                        return true
+                    end
+                end
+            end
+            return false
+        end
+
+        if update_split_ratio(state.root) then
+            prise.request_frame()
+        end
     end
 end
 
@@ -548,7 +521,7 @@ local function render_node(node)
         local is_focused = (node.id == state.focused_id)
         return prise.Terminal({
             pty = node.pty,
-            flex = node.flex or DEFAULT_FLEX,
+            ratio = node.ratio,
             show_cursor = is_focused,
         })
     elseif is_split(node) then
@@ -559,7 +532,8 @@ local function render_node(node)
 
         local props = {
             children = children_widgets,
-            flex = node.flex or DEFAULT_FLEX,
+            ratio = node.ratio,
+            id = node.split_id,
             cross_axis_align = "stretch",
         }
 

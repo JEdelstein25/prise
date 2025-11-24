@@ -4,7 +4,8 @@ function M.Terminal(opts)
     return {
         type = "terminal",
         pty = opts.pty,
-        flex = opts.flex,
+        ratio = opts.ratio,
+        id = opts.id,
         show_cursor = opts.show_cursor,
     }
 end
@@ -52,7 +53,8 @@ function M.Column(opts)
     return {
         type = "column",
         children = opts.children or opts,
-        flex = opts.flex,
+        ratio = opts.ratio,
+        id = opts.id,
         cross_axis_align = opts.cross_axis_align,
         show_cursor = opts.show_cursor,
     }
@@ -70,7 +72,8 @@ function M.Row(opts)
     return {
         type = "row",
         children = opts.children or opts,
-        flex = opts.flex,
+        ratio = opts.ratio,
+        id = opts.id,
         cross_axis_align = opts.cross_axis_align,
         show_cursor = opts.show_cursor,
     }

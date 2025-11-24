@@ -31,12 +31,52 @@ pub const HitRegion = struct {
     }
 };
 
+pub const SplitHandle = struct {
+    parent_id: ?u32,
+    child_index: u16,
+    axis: Axis,
+    boundary: u16,
+    start: u16,
+    end: u16,
+    child_current_size: u16,
+    total_size: u16,
+
+    pub const Axis = enum { horizontal, vertical };
+
+    pub fn contains(self: SplitHandle, px: f64, py: f64) bool {
+        const boundary: f64 = @floatFromInt(self.boundary);
+        const start: f64 = @floatFromInt(self.start);
+        const end: f64 = @floatFromInt(self.end);
+
+        return switch (self.axis) {
+            .horizontal => @abs(px - boundary) < 0.5 and py >= start and py < end,
+            .vertical => @abs(py - boundary) < 0.5 and px >= start and px < end,
+        };
+    }
+
+    pub fn calculateNewRatio(self: SplitHandle, mouse_pos: f64) f32 {
+        const boundary: f64 = @floatFromInt(self.boundary);
+        const child_size: f64 = @floatFromInt(self.child_current_size);
+        const total: f64 = @floatFromInt(self.total_size);
+        if (total == 0) return 0.5;
+
+        // Calculate new ratio based on mouse position relative to the split start
+        const split_start = boundary - child_size;
+        const relative_pos = mouse_pos - split_start;
+        var ratio = relative_pos / total;
+        if (ratio < 0.1) ratio = 0.1;
+        if (ratio > 0.9) ratio = 0.9;
+        return @floatCast(ratio);
+    }
+};
+
 pub const Widget = struct {
     x: u16 = 0,
     y: u16 = 0,
     width: u16 = 0,
     height: u16 = 0,
-    flex: u32 = 0,
+    ratio: ?f32 = null,
+    id: ?u32 = null,
     focus: bool = false,
     kind: WidgetKind,
 
@@ -71,104 +111,91 @@ pub const Widget = struct {
                 .height = constraints.max_height.?,
             },
             .column => |*col| blk: {
+                const total_height = constraints.max_height orelse 0;
                 var width: u16 = 0;
-                var height: u16 = 0;
-                var total_flex: u32 = 0;
 
-                // Pass 1: Measure non-flex children and count total flex
+                // Pass 1: Measure intrinsic children (text) and count proportional children
+                var intrinsic_height: u16 = 0;
+                var nil_count: u16 = 0;
+
                 for (col.children) |*child| {
-                    if (child.flex == 0) {
-                        const remaining_height = if (constraints.max_height) |max|
-                            if (max > height) max - height else 0
-                        else
-                            null;
-
-                        const child_constraints = BoxConstraints{
+                    const is_intrinsic = child.ratio == null and child.kind == .text;
+                    if (is_intrinsic) {
+                        const remaining = if (total_height > intrinsic_height) total_height - intrinsic_height else 0;
+                        const child_constraints: BoxConstraints = .{
                             .min_width = 0,
                             .max_width = constraints.max_width,
                             .min_height = 0,
-                            .max_height = remaining_height,
+                            .max_height = remaining,
                         };
-
                         const child_size = child.layout(child_constraints);
                         child.height = child_size.height;
                         child.width = child_size.width;
-                        height += child_size.height;
+                        intrinsic_height += child_size.height;
                         if (child_size.width > width) width = child_size.width;
-                    } else {
-                        total_flex += child.flex;
+                    } else if (child.ratio == null) {
+                        nil_count += 1;
                     }
                 }
 
-                // Pass 2: Measure flex children
-                if (total_flex > 0) {
-                    const available_height = if (constraints.max_height) |max|
-                        if (max > height) max - height else 0
-                    else
-                        0;
+                // Available space for ratio/nil children
+                const available = if (total_height > intrinsic_height) total_height - intrinsic_height else 0;
 
-                    if (available_height > 0) {
-                        // We need to distribute available_height among flex children
-                        // We'll do a second pass to layout them
-                        var remaining_flex_height = available_height;
-                        var remaining_flex = total_flex;
+                // Pass 2: Allocate ratio children
+                var used_by_ratio: u16 = 0;
+                for (col.children) |*child| {
+                    if (child.ratio) |r| {
+                        const share: u16 = @intFromFloat(@as(f32, @floatFromInt(available)) * r);
+                        const child_constraints: BoxConstraints = .{
+                            .min_width = 0,
+                            .max_width = constraints.max_width,
+                            .min_height = share,
+                            .max_height = share,
+                        };
+                        const child_size = child.layout(child_constraints);
+                        child.height = child_size.height;
+                        child.width = child_size.width;
+                        used_by_ratio += share;
+                        if (child_size.width > width) width = child_size.width;
+                    }
+                }
 
-                        for (col.children) |*child| {
-                            if (child.flex > 0) {
-                                // Calculate share
-                                const share: u16 = @intCast((@as(u32, remaining_flex_height) * @as(u32, child.flex)) / remaining_flex);
-                                remaining_flex_height -= share;
-                                remaining_flex -= child.flex;
+                // Pass 3: Split remaining among nil-ratio non-intrinsic children equally
+                const remaining_for_nil = if (available > used_by_ratio) available - used_by_ratio else 0;
+                if (nil_count > 0 and remaining_for_nil > 0) {
+                    var remaining = remaining_for_nil;
+                    var count = nil_count;
+                    for (col.children) |*child| {
+                        const is_intrinsic = child.kind == .text;
+                        if (child.ratio == null and !is_intrinsic) {
+                            const share = remaining / count;
+                            remaining -= share;
+                            count -= 1;
 
-                                const child_constraints = BoxConstraints{
-                                    .min_width = 0,
-                                    .max_width = constraints.max_width,
-                                    .min_height = share, // Force height? Or at least offer it?
-                                    .max_height = share,
-                                };
-
-                                const child_size = child.layout(child_constraints);
-                                child.height = child_size.height;
-                                child.width = child_size.width;
-                                height += child_size.height;
-                                if (child_size.width > width) width = child_size.width;
-                            }
-                        }
-                    } else {
-                        // No space left for flex children, set them to 0 height
-                        for (col.children) |*child| {
-                            if (child.flex > 0) {
-                                child.height = 0;
-                                child.width = 0;
-                            }
+                            const child_constraints: BoxConstraints = .{
+                                .min_width = 0,
+                                .max_width = constraints.max_width,
+                                .min_height = share,
+                                .max_height = share,
+                            };
+                            const child_size = child.layout(child_constraints);
+                            child.height = child_size.height;
+                            child.width = child_size.width;
+                            if (child_size.width > width) width = child_size.width;
                         }
                     }
                 }
 
                 // Final pass: Position children
                 var current_y: u16 = 0;
+                var final_height: u16 = 0;
                 for (col.children) |*child| {
                     child.y = current_y;
 
                     switch (col.cross_axis_align) {
-                        .start => {
-                            child.x = 0;
-                            // Keep intrinsic width
-                        },
-                        .center => {
-                            if (width > child.width) {
-                                child.x = (width - child.width) / 2;
-                            } else {
-                                child.x = 0;
-                            }
-                        },
-                        .end => {
-                            if (width > child.width) {
-                                child.x = width - child.width;
-                            } else {
-                                child.x = 0;
-                            }
-                        },
+                        .start => child.x = 0,
+                        .center => child.x = if (width > child.width) (width - child.width) / 2 else 0,
+                        .end => child.x = if (width > child.width) width - child.width else 0,
                         .stretch => {
                             child.x = 0;
                             child.width = width;
@@ -176,109 +203,100 @@ pub const Widget = struct {
                     }
 
                     current_y += child.height;
+                    final_height += child.height;
                 }
 
                 break :blk Size{
                     .width = width,
-                    .height = height,
+                    .height = final_height,
                 };
             },
             .row => |*row| blk: {
-                var width: u16 = 0;
+                const total_width = constraints.max_width orelse 0;
                 var height: u16 = 0;
-                var total_flex: u32 = 0;
 
-                // Pass 1: Measure non-flex children and count total flex
+                // Pass 1: Measure intrinsic children (text) and count proportional children
+                var intrinsic_width: u16 = 0;
+                var nil_count: u16 = 0;
+
                 for (row.children) |*child| {
-                    if (child.flex == 0) {
-                        const remaining_width = if (constraints.max_width) |max|
-                            if (max > width) max - width else 0
-                        else
-                            null;
-
-                        const child_constraints = BoxConstraints{
+                    const is_intrinsic = child.ratio == null and child.kind == .text;
+                    if (is_intrinsic) {
+                        const remaining = if (total_width > intrinsic_width) total_width - intrinsic_width else 0;
+                        const child_constraints: BoxConstraints = .{
                             .min_width = 0,
-                            .max_width = remaining_width,
+                            .max_width = remaining,
                             .min_height = 0,
                             .max_height = constraints.max_height,
                         };
-
                         const child_size = child.layout(child_constraints);
                         child.height = child_size.height;
                         child.width = child_size.width;
-                        width += child_size.width;
+                        intrinsic_width += child_size.width;
                         if (child_size.height > height) height = child_size.height;
-                    } else {
-                        total_flex += child.flex;
+                    } else if (child.ratio == null) {
+                        nil_count += 1;
                     }
                 }
 
-                // Pass 2: Measure flex children
-                if (total_flex > 0) {
-                    const available_width = if (constraints.max_width) |max|
-                        if (max > width) max - width else 0
-                    else
-                        0;
+                // Available space for ratio/nil children
+                const available = if (total_width > intrinsic_width) total_width - intrinsic_width else 0;
 
-                    if (available_width > 0) {
-                        var remaining_flex_width = available_width;
-                        var remaining_flex = total_flex;
+                // Pass 2: Allocate ratio children
+                var used_by_ratio: u16 = 0;
+                for (row.children) |*child| {
+                    if (child.ratio) |r| {
+                        const share: u16 = @intFromFloat(@as(f32, @floatFromInt(available)) * r);
+                        const child_constraints: BoxConstraints = .{
+                            .min_width = share,
+                            .max_width = share,
+                            .min_height = 0,
+                            .max_height = constraints.max_height,
+                        };
+                        const child_size = child.layout(child_constraints);
+                        child.height = child_size.height;
+                        child.width = child_size.width;
+                        used_by_ratio += share;
+                        if (child_size.height > height) height = child_size.height;
+                    }
+                }
 
-                        for (row.children) |*child| {
-                            if (child.flex > 0) {
-                                // Calculate share
-                                const share: u16 = @intCast((@as(u32, remaining_flex_width) * @as(u32, child.flex)) / remaining_flex);
-                                remaining_flex_width -= share;
-                                remaining_flex -= child.flex;
+                // Pass 3: Split remaining among nil-ratio non-intrinsic children equally
+                const remaining_for_nil = if (available > used_by_ratio) available - used_by_ratio else 0;
+                if (nil_count > 0 and remaining_for_nil > 0) {
+                    var remaining = remaining_for_nil;
+                    var count = nil_count;
+                    for (row.children) |*child| {
+                        const is_intrinsic = child.kind == .text;
+                        if (child.ratio == null and !is_intrinsic) {
+                            const share = remaining / count;
+                            remaining -= share;
+                            count -= 1;
 
-                                const child_constraints = BoxConstraints{
-                                    .min_width = share,
-                                    .max_width = share,
-                                    .min_height = 0,
-                                    .max_height = constraints.max_height,
-                                };
-
-                                const child_size = child.layout(child_constraints);
-                                child.height = child_size.height;
-                                child.width = child_size.width;
-                                width += child_size.width;
-                                if (child_size.height > height) height = child_size.height;
-                            }
-                        }
-                    } else {
-                        // No space left for flex children
-                        for (row.children) |*child| {
-                            if (child.flex > 0) {
-                                child.height = 0;
-                                child.width = 0;
-                            }
+                            const child_constraints: BoxConstraints = .{
+                                .min_width = share,
+                                .max_width = share,
+                                .min_height = 0,
+                                .max_height = constraints.max_height,
+                            };
+                            const child_size = child.layout(child_constraints);
+                            child.height = child_size.height;
+                            child.width = child_size.width;
+                            if (child_size.height > height) height = child_size.height;
                         }
                     }
                 }
 
                 // Final pass: Position children
                 var current_x: u16 = 0;
+                var final_width: u16 = 0;
                 for (row.children) |*child| {
                     child.x = current_x;
 
                     switch (row.cross_axis_align) {
-                        .start => {
-                            child.y = 0;
-                        },
-                        .center => {
-                            if (height > child.height) {
-                                child.y = (height - child.height) / 2;
-                            } else {
-                                child.y = 0;
-                            }
-                        },
-                        .end => {
-                            if (height > child.height) {
-                                child.y = height - child.height;
-                            } else {
-                                child.y = 0;
-                            }
-                        },
+                        .start => child.y = 0,
+                        .center => child.y = if (height > child.height) (height - child.height) / 2 else 0,
+                        .end => child.y = if (height > child.height) height - child.height else 0,
                         .stretch => {
                             child.y = 0;
                             child.height = height;
@@ -286,10 +304,11 @@ pub const Widget = struct {
                     }
 
                     current_x += child.width;
+                    final_width += child.width;
                 }
 
                 break :blk Size{
-                    .width = width,
+                    .width = final_width,
                     .height = height,
                 };
             },
@@ -387,6 +406,67 @@ pub const Widget = struct {
             .text => {},
         }
     }
+
+    pub fn collectSplitHandles(self: *const Widget, allocator: std.mem.Allocator, offset_x: u16, offset_y: u16) ![]SplitHandle {
+        var handles = std.ArrayList(SplitHandle).empty;
+        errdefer handles.deinit(allocator);
+
+        try self.collectSplitHandlesRecursive(allocator, &handles, offset_x, offset_y);
+
+        return handles.toOwnedSlice(allocator);
+    }
+
+    fn collectSplitHandlesRecursive(self: *const Widget, allocator: std.mem.Allocator, handles: *std.ArrayList(SplitHandle), offset_x: u16, offset_y: u16) !void {
+        const abs_x = offset_x + self.x;
+        const abs_y = offset_y + self.y;
+
+        switch (self.kind) {
+            .surface => {},
+            .text => {},
+            .row => |row| {
+                // Horizontal split handles (between children in a row)
+                for (row.children, 0..) |*child, i| {
+                    // Recurse first
+                    try child.collectSplitHandlesRecursive(allocator, handles, abs_x, abs_y);
+
+                    // Add handle after this child (except for last child)
+                    if (i < row.children.len - 1) {
+                        try handles.append(allocator, .{
+                            .parent_id = self.id,
+                            .child_index = @intCast(i),
+                            .axis = .horizontal,
+                            .boundary = abs_x + child.x + child.width,
+                            .start = abs_y,
+                            .end = abs_y + self.height,
+                            .child_current_size = child.width,
+                            .total_size = self.width,
+                        });
+                    }
+                }
+            },
+            .column => |col| {
+                // Vertical split handles (between children in a column)
+                for (col.children, 0..) |*child, i| {
+                    // Recurse first
+                    try child.collectSplitHandlesRecursive(allocator, handles, abs_x, abs_y);
+
+                    // Add handle after this child (except for last child)
+                    if (i < col.children.len - 1) {
+                        try handles.append(allocator, .{
+                            .parent_id = self.id,
+                            .child_index = @intCast(i),
+                            .axis = .vertical,
+                            .boundary = abs_y + child.y + child.height,
+                            .start = abs_x,
+                            .end = abs_x + self.width,
+                            .child_current_size = child.height,
+                            .total_size = self.height,
+                        });
+                    }
+                }
+            },
+        }
+    }
 };
 
 pub fn hitTest(regions: []const HitRegion, x: f64, y: f64) ?u32 {
@@ -404,6 +484,17 @@ pub fn findRegion(regions: []const HitRegion, pty_id: u32) ?HitRegion {
     for (regions) |region| {
         if (region.pty_id == pty_id) {
             return region;
+        }
+    }
+    return null;
+}
+
+pub fn hitTestSplitHandle(handles: []const SplitHandle, x: f64, y: f64) ?*const SplitHandle {
+    var i = handles.len;
+    while (i > 0) {
+        i -= 1;
+        if (handles[i].contains(x, y)) {
+            return &handles[i];
         }
     }
     return null;
@@ -627,13 +718,6 @@ pub fn parseWidget(lua: *ziglua.Lua, allocator: std.mem.Allocator, index: i32) !
     const widget_type = try lua.toString(-1);
     lua.pop(1);
 
-    var flex: u32 = 0;
-    _ = lua.getField(index, "flex");
-    if (lua.typeOf(-1) == .number) {
-        flex = @intCast(try lua.toInteger(-1));
-    }
-    lua.pop(1);
-
     var focus: bool = false;
     _ = lua.getField(index, "focus");
     if (lua.typeOf(-1) == .boolean) {
@@ -648,31 +732,21 @@ pub fn parseWidget(lua: *ziglua.Lua, allocator: std.mem.Allocator, index: i32) !
     }
     lua.pop(1);
 
+    var ratio: ?f32 = null;
+    _ = lua.getField(index, "ratio");
+    if (lua.typeOf(-1) == .number) {
+        ratio = @floatCast(lua.toNumber(-1) catch 0.0);
+    }
+    lua.pop(1);
+
+    var id: ?u32 = null;
+    _ = lua.getField(index, "id");
+    if (lua.typeOf(-1) == .number) {
+        id = @intCast(lua.toInteger(-1) catch 0);
+    }
+    lua.pop(1);
+
     if (std.mem.eql(u8, widget_type, "terminal")) {
-        // Surface default flex is 1 if not specified?
-        // User said: "a surface should probably be flex = 1 by default"
-        // But we already parsed flex=0 if not present.
-        // So if flex field was missing (or 0), we should set it to 1?
-        // Or maybe only if it was missing.
-        // But standard practice is usually explicit.
-        // However, the requirement is "surface should probably be flex = 1 by default".
-        // Let's check if "flex" field existed.
-        // Actually, simpler: if we didn't find flex (so flex==0), and it's a surface, make it 1.
-        // But what if user wants fixed surface? They can set flex=0.
-        // To distinguish "not set" from "set to 0", we'd need to check field existence.
-        // For now, let's assume surface implies flex=1 unless overridden?
-        // The simplest way to support "default flex=1" without complex logic is:
-        // if type is surface and we didn't see a flex > 0, default to 1?
-        // But then user can't set flex=0.
-        // Let's check properly.
-
-        var actual_flex = flex;
-        _ = lua.getField(index, "flex");
-        if (lua.typeOf(-1) == .nil) {
-            actual_flex = 1;
-        }
-        lua.pop(1);
-
         _ = lua.getField(index, "pty");
 
         const pty_id = lua_event.getPtyId(lua, -1) catch {
@@ -681,7 +755,7 @@ pub fn parseWidget(lua: *ziglua.Lua, allocator: std.mem.Allocator, index: i32) !
         };
         lua.pop(1);
 
-        return .{ .flex = actual_flex, .focus = focus, .kind = .{ .surface = .{ .pty_id = @intCast(pty_id) } } };
+        return .{ .ratio = ratio, .id = id, .focus = focus, .kind = .{ .surface = .{ .pty_id = @intCast(pty_id) } } };
     } else if (std.mem.eql(u8, widget_type, "column")) {
         _ = lua.getField(index, "children");
         if (lua.typeOf(-1) != .table) {
@@ -716,7 +790,7 @@ pub fn parseWidget(lua: *ziglua.Lua, allocator: std.mem.Allocator, index: i32) !
         }
         lua.pop(1);
 
-        return .{ .flex = flex, .focus = focus, .kind = .{ .column = .{
+        return .{ .ratio = ratio, .id = id, .focus = focus, .kind = .{ .column = .{
             .children = try children.toOwnedSlice(allocator),
             .cross_axis_align = cross_align,
         } } };
@@ -754,7 +828,7 @@ pub fn parseWidget(lua: *ziglua.Lua, allocator: std.mem.Allocator, index: i32) !
         }
         lua.pop(1);
 
-        return .{ .flex = flex, .focus = focus, .kind = .{ .row = .{
+        return .{ .ratio = ratio, .id = id, .focus = focus, .kind = .{ .row = .{
             .children = try children.toOwnedSlice(allocator),
             .cross_axis_align = cross_align,
         } } };
@@ -825,7 +899,7 @@ pub fn parseWidget(lua: *ziglua.Lua, allocator: std.mem.Allocator, index: i32) !
         }
         lua.pop(1);
 
-        return .{ .flex = flex, .focus = focus, .kind = .{ .text = .{
+        return .{ .ratio = ratio, .id = id, .focus = focus, .kind = .{ .text = .{
             .spans = try spans.toOwnedSlice(allocator),
             .wrap = wrap,
             .@"align" = @"align",
@@ -904,76 +978,40 @@ fn parseColor(str: []const u8) !vaxis.Color {
     return .default;
 }
 
-test "parseWidget - surface default flex" {
+test "parseWidget - surface with ratio" {
     const testing = std.testing;
     const allocator = testing.allocator;
 
     var lua = try ziglua.Lua.init(allocator);
     defer lua.deinit();
 
-    lua.createTable(0, 2);
-    _ = lua.pushString("terminal");
-    lua.setField(-2, "type");
-    _ = lua.pushInteger(1);
-    lua.setField(-2, "pty");
-
-    var w = try parseWidget(lua, allocator, -1);
-    defer w.deinit(allocator);
-
-    try testing.expectEqual(@as(u32, 1), w.flex);
-}
-
-test "parseWidget - explicit flex" {
-    const testing = std.testing;
-    const allocator = testing.allocator;
-
-    var lua = try ziglua.Lua.init(allocator);
-    defer lua.deinit();
-
-    // Text with flex=1
-    lua.createTable(0, 3);
-    _ = lua.pushString("text");
-    lua.setField(-2, "type");
-    lua.createTable(0, 0);
-    lua.setField(-2, "content");
-    _ = lua.pushInteger(1);
-    lua.setField(-2, "flex");
-
-    var w = try parseWidget(lua, allocator, -1);
-    defer w.deinit(allocator);
-
-    try testing.expectEqual(@as(u32, 1), w.flex);
-
-    // Surface with flex=2
     lua.createTable(0, 3);
     _ = lua.pushString("terminal");
     lua.setField(-2, "type");
     _ = lua.pushInteger(1);
     lua.setField(-2, "pty");
-    _ = lua.pushInteger(2);
-    lua.setField(-2, "flex");
+    _ = lua.pushNumber(0.6);
+    lua.setField(-2, "ratio");
 
-    var w2 = try parseWidget(lua, allocator, -1);
-    defer w2.deinit(allocator);
+    var w = try parseWidget(lua, allocator, -1);
+    defer w.deinit(allocator);
 
-    try testing.expectEqual(@as(u32, 2), w2.flex);
+    try testing.expectApproxEqAbs(@as(f32, 0.6), w.ratio.?, 0.001);
 }
 
-test "Column Layout - Flex" {
+test "Column Layout - Intrinsic + Proportional" {
     const testing = std.testing;
     const allocator = testing.allocator;
 
     // Create widgets manually
     var child1 = Widget{
         .kind = .{ .text = .{ .spans = try allocator.dupe(Text.Span, &.{.{ .text = "Fixed", .style = .{} }}) } },
-        .flex = 0,
     };
     // Manually copy string because deinit will try to free it
     child1.kind.text.spans[0].text = try allocator.dupe(u8, "Fixed");
 
     const child2 = Widget{
         .kind = .{ .surface = .{ .pty_id = 1 } },
-        .flex = 1,
     };
 
     var children = [_]Widget{ child1, child2 };
@@ -982,7 +1020,7 @@ test "Column Layout - Flex" {
     };
 
     // Layout in 100x20 box
-    const constraints = BoxConstraints{
+    const constraints: BoxConstraints = .{
         .min_width = 0,
         .max_width = 100,
         .min_height = 0,
@@ -992,11 +1030,11 @@ test "Column Layout - Flex" {
     const size = col.layout(constraints);
 
     try testing.expectEqual(@as(u16, 20), size.height);
-    // Child 1 (Fixed) should be 1 high
+    // Child 1 (text, intrinsic) should be 1 high
     try testing.expectEqual(@as(u16, 1), children[0].height);
     try testing.expectEqual(@as(u16, 0), children[0].y);
 
-    // Child 2 (Flex) should be 19 high
+    // Child 2 (surface, nil ratio) should take remaining 19 high
     try testing.expectEqual(@as(u16, 19), children[1].height);
     try testing.expectEqual(@as(u16, 1), children[1].y);
 
@@ -1012,14 +1050,12 @@ test "Column Layout - Stretch Width" {
     // Child 1: Text "Small"
     var child1 = Widget{
         .kind = .{ .text = .{ .spans = try allocator.dupe(Text.Span, &.{.{ .text = "Small", .style = .{} }}) } },
-        .flex = 0,
     };
     child1.kind.text.spans[0].text = try allocator.dupe(u8, "Small");
 
     // Child 2: Surface (Full Width)
     const child2 = Widget{
         .kind = .{ .surface = .{ .pty_id = 1 } },
-        .flex = 1,
     };
 
     var children = [_]Widget{ child1, child2 };
