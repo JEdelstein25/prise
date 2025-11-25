@@ -164,6 +164,7 @@ pub const ClientState = struct {
     next_msgid: u32 = 1,
     pending_requests: std.AutoHashMap(u32, RequestInfo),
     allocator: std.mem.Allocator,
+    prefix_mode: bool = false,
 
     pub const RequestInfo = union(enum) {
         spawn,
@@ -349,10 +350,6 @@ pub const ClientLogic = struct {
     pub fn encodeEvent(allocator: std.mem.Allocator, event: vaxis.Event) !?[]u8 {
         switch (event) {
             .key_press => |key| {
-                if (key.codepoint == 'c' and key.mods.ctrl) {
-                    return try msgpack.encode(allocator, .{"quit"});
-                }
-
                 // Build key map in W3C KeyboardEvent format
                 const key_strs = try vaxis_helper.vaxisKeyToStrings(allocator, key);
                 defer allocator.free(key_strs.key);
@@ -917,19 +914,6 @@ pub const App = struct {
                     return;
                 }
 
-                if (key.codepoint == 'c' and key.mods.ctrl) {
-                    std.log.info("Ctrl+C detected, quitting", .{});
-                    self.state.should_quit = true;
-                    if (self.connected) {
-                        posix.close(self.fd);
-                        self.connected = false;
-                    }
-                    if (self.recv_task) |*task| {
-                        if (self.io_loop) |loop| task.cancel(loop) catch {};
-                        self.recv_task = null;
-                    }
-                    return;
-                }
             },
             .winsize => |ws| {
                 // Calculate and store cell metrics
@@ -1878,25 +1862,6 @@ pub const App = struct {
 test "ClientLogic - encodeEvent" {
     const testing = std.testing;
     const allocator = testing.allocator;
-
-    // Test Ctrl+C
-    {
-        const event = vaxis.Event{
-            .key_press = .{
-                .codepoint = 'c',
-                .mods = .{ .ctrl = true },
-            },
-        };
-        const msg = (try ClientLogic.encodeEvent(allocator, event)).?;
-        defer allocator.free(msg);
-
-        const val = try msgpack.decode(allocator, msg);
-        defer val.deinit(allocator);
-
-        try testing.expectEqual(std.meta.Tag(msgpack.Value).array, std.meta.activeTag(val));
-        try testing.expectEqual(1, val.array.len);
-        try testing.expectEqualStrings("quit", val.array[0].string);
-    }
 
     // Test Key Press
     {

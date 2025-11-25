@@ -449,6 +449,10 @@ function M.update(event)
                 -- Detach from session
                 prise.detach("default")
                 handled = true
+            elseif k == "q" then
+                -- Quit
+                prise.quit()
+                handled = true
             end
 
             if handled then
