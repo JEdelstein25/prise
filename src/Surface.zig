@@ -310,6 +310,15 @@ pub fn applyRedraw(self: *Surface, params: msgpack.Value) !void {
                             .char = .{ .grapheme = text, .width = @intCast(width) },
                             .style = style,
                         });
+                        // Write spacer cells for wide characters
+                        for (1..width) |offset| {
+                            if (col + offset < self.cols) {
+                                self.back.writeCell(@intCast(col + offset), @intCast(row), .{
+                                    .char = .{ .grapheme = "", .width = 0 },
+                                    .style = style,
+                                });
+                            }
+                        }
                     }
                     col += width;
                 }
