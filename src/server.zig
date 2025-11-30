@@ -1,6 +1,7 @@
 //! Server that manages PTY sessions and client connections.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 const ghostty_vt = @import("ghostty-vt");
 
@@ -13,6 +14,11 @@ const pty = @import("pty.zig");
 const redraw = @import("redraw.zig");
 const rpc = @import("rpc.zig");
 const vt_handler = @import("vt_handler.zig");
+
+const csig = @cImport({
+    @cInclude("signal.h");
+    @cInclude("unistd.h");
+});
 
 const posix = std.posix;
 
@@ -142,20 +148,7 @@ const Pty = struct {
         return instance;
     }
 
-    /// Signal the PTY to stop and cancel pending I/O (non-blocking)
-    fn stopAndCancelIO(self: *Pty, loop: *io.Loop) void {
-        self.running.store(false, .seq_cst);
-        // Signal read thread to exit
-        _ = posix.write(self.exit_pipe_fds[1], "q") catch {};
-
-        // Send SIGHUP to the process group (standard behavior when PTY closes)
-        _ = posix.kill(-self.process.pid, posix.SIG.HUP) catch {};
-
-        self.cancelPendingIO(loop);
-    }
-
-    /// Cancel pending IO operations without signaling the process.
-    /// Use when process has already exited.
+    /// Cancel pending IO operations.
     fn cancelPendingIO(self: *Pty, loop: *io.Loop) void {
         // Cancel any pending render timer
         if (self.render_timer) |*task| {
@@ -338,33 +331,106 @@ const Pty = struct {
             };
 
             if (poll_fds[1].revents & posix.POLL.IN != 0) {
-                log.info("PTY {} received exit signal on pipe", .{self.id});
                 break;
             }
 
             // Check for POLLHUP on master (process closed its side)
             if (poll_fds[0].revents & posix.POLL.HUP != 0) {
-                log.info("PTY {} master got POLLHUP", .{self.id});
+                self.running.store(false, .seq_cst);
+                break;
             }
         }
-        log.info("PTY read thread exiting for PTY {} (running={})", .{ self.id, self.running.load(.seq_cst) });
+        log.info("PTY read thread exiting for PTY {}", .{self.id});
 
-        // Reap the child process. SIGHUP was already sent by stopAndCancelIO or
-        // by the kernel when the PTY master was closed, so just wait.
-        const result = posix.waitpid(self.process.pid, 0);
-        const status = result.status;
-        log.info("PTY {} process {} exited with status {}", .{ self.id, self.process.pid, status });
-
+        // Ghostty-style kill loop: repeatedly signal and poll until process exits
+        const status = self.killAndReap();
         self.exit_status.store(status, .seq_cst);
         self.exited.store(true, .seq_cst);
 
-        // Postcondition: exited flag must be set before signaling main thread
-        std.debug.assert(self.exited.load(.seq_cst));
-
-        // Signal main thread about exit (best-effort, non-blocking)
+        // Signal main thread that process has exited (reuse dirty pipe)
         _ = posix.write(self.pipe_fds[1], "e") catch {};
     }
+
+    /// Kill the process group and reap the child. Returns exit status.
+    /// Closes master fd first (triggers kernel SIGHUP), then escalates signals.
+    fn killAndReap(self: *Pty) u32 {
+        const pid = self.process.pid;
+
+        // Close master fd first - this triggers kernel SIGHUP to the process group
+        // when the slave side detects the hangup condition
+        posix.close(self.process.master);
+        self.process.master = -1;
+
+        // Get the process group ID, waiting for setsid if needed
+        const pgid = getpgid(pid) orelse {
+            // Process doesn't exist, try to reap anyway
+            const res = posix.waitpid(pid, posix.W.NOHANG);
+            return res.status;
+        };
+
+        // Wait a bit for kernel-triggered SIGHUP to take effect
+        for (0..10) |_| {
+            const res = posix.waitpid(pid, posix.W.NOHANG);
+            if (res.pid != 0) {
+                log.info("PTY {} process exited with status {}", .{ self.id, res.status });
+                return res.status;
+            }
+            std.Thread.sleep(10 * std.time.ns_per_ms);
+        }
+
+        // Signal escalation: SIGHUP -> SIGTERM -> SIGKILL
+        const signals = [_]c_int{ csig.SIGHUP, csig.SIGTERM, csig.SIGKILL };
+        const iterations_per_signal: usize = 10; // 10 * 10ms = 100ms per signal
+
+        for (signals) |sig| {
+            _ = csig.killpg(pgid, sig);
+
+            for (0..iterations_per_signal) |_| {
+                const res = posix.waitpid(pid, posix.W.NOHANG);
+                if (res.pid != 0) {
+                    log.info("PTY {} process exited with status {}", .{ self.id, res.status });
+                    return res.status;
+                }
+                std.Thread.sleep(10 * std.time.ns_per_ms);
+            }
+        }
+
+        // SIGKILL should always work, but keep trying
+        log.warn("PTY {} process still alive after SIGKILL, polling", .{self.id});
+        while (true) {
+            const res = posix.waitpid(pid, posix.W.NOHANG);
+            if (res.pid != 0) {
+                log.info("PTY {} process exited with status {}", .{ self.id, res.status });
+                return res.status;
+            }
+            std.Thread.sleep(10 * std.time.ns_per_ms);
+        }
+    }
 };
+
+/// Get the process group ID for a pid, waiting for setsid if needed.
+/// Returns null if the process doesn't exist.
+fn getpgid(pid: posix.pid_t) ?posix.pid_t {
+    // Get our own process group ID
+    const my_pgid = csig.getpgid(0);
+
+    // Loop while pgid == my_pgid (setsid not yet called by child)
+    while (true) {
+        const pgid = csig.getpgid(pid);
+
+        // If still in parent's group, setsid() hasn't completed yet
+        if (pgid == my_pgid) {
+            std.Thread.sleep(10 * std.time.ns_per_ms);
+            continue;
+        }
+
+        // Invalid or error cases
+        if (pgid == 0) return null;
+        if (pgid < 0) return null;
+
+        return pgid;
+    }
+}
 
 /// Map ghostty MouseShape to redraw MouseShape
 fn mapMouseShape(shape: ghostty_vt.MouseShape) redraw.UIEvent.MouseShape.Shape {
@@ -1665,14 +1731,12 @@ const Server = struct {
             return msgpack.Value{ .string = try self.allocator.dupe(u8, "invalid params") };
         };
 
-        if (self.ptys.fetchRemove(pty_id)) |kv| {
-            const pty_instance = kv.value;
-            pty_instance.stopAndCancelIO(self.loop);
-            self.sendPtyExited(pty_id, 0) catch |err| {
-                log.err("Failed to send pty_exited on close: {}", .{err});
-            };
-            pty_instance.joinAndFree(self.allocator);
-            log.info("Closed PTY {}", .{pty_id});
+        if (self.ptys.get(pty_id)) |pty_instance| {
+            // Signal read thread to exit - it will handle killing and reaping the process
+            pty_instance.running.store(false, .seq_cst);
+            _ = posix.write(pty_instance.exit_pipe_fds[1], "q") catch {};
+
+            log.info("Signaled PTY {} to close", .{pty_id});
             return msgpack.Value.nil;
         } else {
             return msgpack.Value{ .string = try self.allocator.dupe(u8, "PTY not found") };
@@ -1970,9 +2034,9 @@ const Server = struct {
         for (to_remove.items) |pty_id| {
             if (self.ptys.getPtr(pty_id)) |pty_ptr| {
                 std.log.info("Killing PTY {} (no clients, not keep_alive)", .{pty_id});
-                // Signal PTY to stop and cancel I/O, but don't join thread yet
-                // Thread join happens in startServer defer block after event loop exits
-                pty_ptr.*.stopAndCancelIO(self.loop);
+                // Signal read thread to exit - it will handle killing and reaping
+                pty_ptr.*.running.store(false, .seq_cst);
+                _ = posix.write(pty_ptr.*.exit_pipe_fds[1], "q") catch {};
             }
         }
     }
@@ -2147,11 +2211,11 @@ const Server = struct {
         // Cancel signal watcher
         self.loop.cancelByFd(self.signal_pipe_fds[0]);
 
-        // Signal all PTYs to stop and cancel their pending I/O
-        // (thread joins happen after event loop exits in startServer defer)
+        // Signal all PTYs to stop (read threads will handle killing and reaping)
         var it = self.ptys.valueIterator();
         while (it.next()) |pty_instance| {
-            pty_instance.*.stopAndCancelIO(self.loop);
+            pty_instance.*.running.store(false, .seq_cst);
+            _ = posix.write(pty_instance.*.exit_pipe_fds[1], "q") catch {};
         }
     }
 
@@ -2197,30 +2261,29 @@ const Server = struct {
             .read => |n| {
                 if (n == 0) return;
 
-                // Drain pipe
+                // Check if this is an exit signal from the read thread
+                if (pty_instance.dirty_signal_buf[0] == 'e') {
+                    // Process has exited - read thread already reaped it
+                    server.handleProcessExit(loop, pty_instance);
+                    return;
+                }
+
+                // Drain pipe (there may be more signals)
                 var buf: [128]u8 = undefined;
+                var saw_exit = false;
                 while (true) {
-                    _ = posix.read(pty_instance.pipe_fds[0], &buf) catch |err| {
+                    const bytes = posix.read(pty_instance.pipe_fds[0], &buf) catch |err| {
                         if (err == error.WouldBlock) break;
                         break;
                     };
+                    // Check for exit signal in drained data
+                    for (buf[0..bytes]) |b| {
+                        if (b == 'e') saw_exit = true;
+                    }
                 }
 
-                // Check if exited
-                if (pty_instance.exited.load(.acquire)) {
-                    const status = pty_instance.exit_status.load(.acquire);
-                    server.sendPtyExited(pty_instance.id, status) catch |err| {
-                        std.log.err("Failed to send pty_exited: {}", .{err});
-                    };
-                    // Render final frame
-                    server.renderFrame(pty_instance);
-                    // Remove from server's pty map and clean up
-                    // Ensure running is false before cleanup (read thread sets it, but be explicit)
-                    pty_instance.running.store(false, .seq_cst);
-                    // Cancel pending IO and timers before freeing (process already exited)
-                    _ = server.ptys.fetchRemove(pty_instance.id);
-                    pty_instance.cancelPendingIO(loop);
-                    pty_instance.joinAndFree(server.allocator);
+                if (saw_exit) {
+                    server.handleProcessExit(loop, pty_instance);
                     return;
                 }
 
@@ -2254,6 +2317,42 @@ const Server = struct {
             },
             else => {},
         }
+    }
+
+    fn handleProcessExit(self: *Server, loop: *io.Loop, pty_instance: *Pty) void {
+        const status = pty_instance.exit_status.load(.seq_cst);
+        log.info("PTY {} process exited with status {}", .{ pty_instance.id, status });
+
+        // Send exit notification to clients
+        self.sendPtyExited(pty_instance.id, status) catch |err| {
+            std.log.err("Failed to send pty_exited: {}", .{err});
+        };
+
+        // Render final frame
+        self.renderFrame(pty_instance);
+
+        // Remove from server's pty map
+        _ = self.ptys.fetchRemove(pty_instance.id);
+
+        // Cancel pending IO and join read thread
+        pty_instance.cancelPendingIO(loop);
+
+        if (pty_instance.read_thread) |thread| {
+            thread.join();
+            pty_instance.read_thread = null;
+        }
+
+        // Free PTY resources
+        pty_instance.process.close();
+        posix.close(pty_instance.pipe_fds[0]);
+        posix.close(pty_instance.pipe_fds[1]);
+        posix.close(pty_instance.exit_pipe_fds[0]);
+        posix.close(pty_instance.exit_pipe_fds[1]);
+        pty_instance.terminal.deinit(self.allocator);
+        pty_instance.render_state.deinit(self.allocator);
+        pty_instance.clients.deinit(self.allocator);
+        pty_instance.title.deinit(self.allocator);
+        self.allocator.destroy(pty_instance);
     }
 };
 
@@ -2902,23 +3001,20 @@ test "server - pty exit notification" {
 
     try server.ptys.put(1, pty_inst);
 
-    // Register dirty signal pipe (like in spawn_pty)
+    // Register dirty pipe read (like in spawn_pty)
     _ = try loop.read(pty_inst.pipe_fds[0], &pty_inst.dirty_signal_buf, .{
         .ptr = pty_inst,
         .cb = Server.onPtyDirty,
     });
 
-    // Simulate exit
-    pty_inst.exited.store(true, .seq_cst);
+    // Simulate process exit: set status and send "e" signal through pipe
     pty_inst.exit_status.store(123, .seq_cst);
+    pty_inst.exited.store(true, .seq_cst);
 
-    // Write to pipe so posix.read finds something
-    _ = try posix.write(pipe_fds[1], "e");
+    // Complete the read with "e" signal
+    try loop.completeRead(pty_inst.pipe_fds[0], "e");
 
-    // Trigger mock completion
-    try loop.completeRead(pipe_fds[0], "e");
-
-    // Run loop to process onPtyDirty
+    // Run loop to process onPtyDirty -> handleProcessExit
     try loop.run(.once);
 
     // Check pending sends
