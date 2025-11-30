@@ -299,6 +299,13 @@ const Pty = struct {
                 log.info("PTY {} process {} exited with status {}", .{ self.id, self.process.pid, status });
                 break;
             }
+            // Check if process still exists (kill with signal 0)
+            posix.kill(self.process.pid, 0) catch |err| {
+                if (err == error.ProcessNotFound) {
+                    log.info("PTY {} process {} no longer exists", .{ self.id, self.process.pid });
+                    break;
+                }
+            };
             // Escalate signals: SIGHUP -> SIGTERM -> SIGKILL
             if (attempts < 5) {
                 log.info("PTY {} process {} still alive, sending HUP", .{ self.id, self.process.pid });
@@ -1330,8 +1337,6 @@ const Client = struct {
                     return;
                 }
 
-                log.debug("Received {} bytes from client fd={}", .{ bytes_read, client.fd });
-
                 // Accumulate received data
                 client.msg_buffer.appendSlice(allocator, client.recv_buffer[0..bytes_read]) catch |err| {
                     log.err("Failed to append to msg_buffer: {}", .{err});
@@ -1342,7 +1347,7 @@ const Client = struct {
                 // Process all complete messages in the buffer
                 while (client.msg_buffer.items.len > 0) {
                     const result = rpc.decodeMessageWithSize(allocator, client.msg_buffer.items) catch |err| {
-                        if (err == error.EndOfStream) {
+                        if (err == error.EndOfStream or err == error.UnexpectedEndOfInput) {
                             // Incomplete message, wait for more data
                             break;
                         }
@@ -1973,8 +1978,6 @@ const Server = struct {
 
     /// Send redraw notification (bytes) to attached clients
     fn sendRedraw(self: *Server, loop: *io.Loop, pty_instance: *Pty, msg: []const u8, target_client: ?*Client) !void {
-        std.log.debug("sendRedraw: session={} bytes={} target_client={} total_clients={}", .{ pty_instance.id, msg.len, target_client != null, self.clients.items.len });
-
         // Send to each client attached to this session
         for (self.clients.items) |client| {
             // If we have a target client, skip others

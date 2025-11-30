@@ -34,20 +34,6 @@ pub fn encode(
     state: TerminalState,
 ) !void {
     const flags = state.flags;
-    const modes = state.modes;
-
-    log.debug("mouse_encode: event={s} format={s} x10={} normal={} button={} any={} utf8={} sgr={} urxvt={} sgr_pixels={}", .{
-        @tagName(flags.mouse_event),
-        @tagName(flags.mouse_format),
-        modes.get(.mouse_event_x10),
-        modes.get(.mouse_event_normal),
-        modes.get(.mouse_event_button),
-        modes.get(.mouse_event_any),
-        modes.get(.mouse_format_utf8),
-        modes.get(.mouse_format_sgr),
-        modes.get(.mouse_format_urxvt),
-        modes.get(.mouse_format_sgr_pixels),
-    });
 
     // Check if mouse reporting is enabled
     if (flags.mouse_event == .none) return;
@@ -129,7 +115,6 @@ fn encodeSGR(writer: anytype, col: u16, row: u16, event: key_parse.MouseEvent) !
     // Format: CSI < Cb ; Cx ; Cy M (or m for release)
     const char: u8 = if (event.type == .release) 'm' else 'M';
 
-    log.debug("encodeSGR: col={} (sent {})", .{ col, col + 1 });
     try writer.print("\x1b[<{};{};{}{c}", .{ cb, col + 1, row + 1, char });
 }
 
