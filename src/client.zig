@@ -1863,9 +1863,23 @@ pub const App = struct {
                                 app.ui.update(.{ .pty_exited = .{ .id = info.pty_id, .status = info.status } }) catch |err| {
                                     log.err("Failed to update UI with pty_exited: {}", .{err});
                                 };
+                                // Clean up the surface for this PTY
+                                if (app.surfaces.fetchRemove(info.pty_id)) |entry| {
+                                    log.info("Cleaning up surface for exited PTY {}", .{info.pty_id});
+                                    entry.value.deinit();
+                                    app.allocator.destroy(entry.value);
+                                }
                             },
                             .detached => {
-                                log.info("Detach complete, closing connection", .{});
+                                log.info("Detach complete, cleaning up {} surfaces", .{app.surfaces.count()});
+                                // Clean up all surfaces before closing
+                                var surface_it = app.surfaces.valueIterator();
+                                while (surface_it.next()) |surface| {
+                                    surface.*.deinit();
+                                    app.allocator.destroy(surface.*);
+                                }
+                                app.surfaces.clearRetainingCapacity();
+
                                 app.state.should_quit = true;
                                 if (app.connected) {
                                     posix.close(app.fd);
