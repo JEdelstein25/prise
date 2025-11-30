@@ -14,21 +14,35 @@ zigdoc vaxis.Window
 
 ## Code Style
 
-Prefer explicit type annotation with anonymous struct literals over explicit type instantiation.
+**Naming:**
+- `camelCase` for functions and methods
+- `snake_case` for variables and parameters
+- `PascalCase` for types, structs, and enums
+- `SCREAMING_SNAKE_CASE` for constants
 
-Good:
+**Struct initialization:** Prefer explicit type annotation with anonymous literals:
 ```zig
-const foo: Type = .{ ... };
+const foo: Type = .{ .field = value };  // Good
+const foo = Type{ .field = value };     // Avoid
 ```
 
-Bad:
-```zig
-const foo = Type{ ... };
-```
+**File structure:**
+1. `//!` doc comment describing the module
+2. `const Self = @This();` (for self-referential types)
+3. Imports: `std` → `builtin` → project modules
+4. `const log = std.log.scoped(.module_name);`
+
+**Functions:** Order methods as `init` → `deinit` → public API → private helpers
+
+**Memory:** Pass allocators explicitly, use `errdefer` for cleanup on error
+
+**Documentation:** Use `///` for public API, `//` for implementation notes
+
+**Tests:** Inline in the same file, register in src/main.zig test block
 
 ## Build Commands
 
-- Build and run: `zig build run`
+- Build: `zig build`
 - Format code: `zig build fmt`
 - Run tests: `zig build test`
 
