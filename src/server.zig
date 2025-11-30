@@ -104,6 +104,12 @@ const Pty = struct {
         // Send SIGHUP to the process group (standard behavior when PTY closes)
         _ = posix.kill(-self.process.pid, posix.SIG.HUP) catch {};
 
+        self.cancelPendingIO(loop);
+    }
+
+    /// Cancel pending IO operations without signaling the process.
+    /// Use when process has already exited.
+    fn cancelPendingIO(self: *Pty, loop: *io.Loop) void {
         // Cancel any pending render timer
         if (self.render_timer) |*task| {
             task.cancel(loop) catch {};
@@ -1935,8 +1941,9 @@ const Server = struct {
                     // Render final frame
                     server.renderFrame(pty_instance);
                     // Remove from server's pty map and clean up
-                    // Process already exited, so just join thread and free resources
+                    // Cancel pending IO and timers before freeing (process already exited)
                     _ = server.ptys.fetchRemove(pty_instance.id);
+                    pty_instance.cancelPendingIO(loop);
                     pty_instance.joinAndFree(server.allocator);
                     return;
                 }
