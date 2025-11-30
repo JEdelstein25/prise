@@ -662,11 +662,13 @@ const Client = struct {
     send_buffer: ?[]u8 = null,
     send_queue: std.ArrayList([]u8),
     attached_sessions: std.ArrayList(usize),
+    closing: bool = false,
     // Map style ID to its last known definition hash/attributes to detect changes
     // We store the Attributes struct directly.
     // style_cache: std.AutoHashMap(u16, redraw.UIEvent.Style.Attributes),
 
     fn sendData(self: *Client, loop: *io.Loop, data: []const u8) !void {
+        if (self.closing) return;
         const buf = try self.server.allocator.dupe(u8, data);
 
         // If there's a pending send, queue this one
@@ -685,11 +687,18 @@ const Client = struct {
 
     fn onSendComplete(loop: *io.Loop, completion: io.Completion) anyerror!void {
         const client = completion.userdataCast(Client);
+        const allocator = client.server.allocator;
 
         // Free send buffer
         if (client.send_buffer) |buf| {
-            client.server.allocator.free(buf);
+            allocator.free(buf);
             client.send_buffer = null;
+        }
+
+        // If client is closing, finish cleanup now that in-flight send is done
+        if (client.closing) {
+            client.finishClose(loop);
+            return;
         }
 
         switch (completion.result) {
@@ -708,12 +717,43 @@ const Client = struct {
                 log.err("Send failed: {}", .{err});
                 // Clear queue on error
                 for (client.send_queue.items) |buf| {
-                    client.server.allocator.free(buf);
+                    allocator.free(buf);
                 }
                 client.send_queue.clearRetainingCapacity();
             },
             else => unreachable,
         }
+    }
+
+    fn finishClose(self: *Client, loop: *io.Loop) void {
+        const server = self.server;
+        const allocator = server.allocator;
+
+        // Free any remaining queued sends
+        for (self.send_queue.items) |buf| {
+            allocator.free(buf);
+        }
+        self.send_queue.deinit(allocator);
+        self.attached_sessions.deinit(allocator);
+
+        // Remove from server's client list
+        for (server.clients.items, 0..) |c, i| {
+            if (c == self) {
+                _ = server.clients.swapRemove(i);
+                break;
+            }
+        }
+
+        _ = loop.close(self.fd, .{
+            .ptr = null,
+            .cb = struct {
+                fn noop(_: *io.Loop, _: io.Completion) anyerror!void {}
+            }.noop,
+        }) catch {};
+
+        allocator.destroy(self);
+        std.log.debug("Total clients: {}", .{server.clients.items.len});
+        server.checkExit() catch {};
     }
 
     fn handleMessage(self: *Client, loop: *io.Loop, data: []const u8) !void {
@@ -1753,43 +1793,23 @@ const Server = struct {
 
     fn removeClient(self: *Server, client: *Client) void {
         std.log.debug("Removing client fd={}", .{client.fd});
+
         // Cleanup PTYs (kill if no clients remain and not keep_alive)
         self.cleanupPtysForClient(client);
 
-        // Free any queued sends
-        for (client.send_queue.items) |buf| {
-            self.allocator.free(buf);
-        }
-        client.send_queue.deinit(self.allocator);
+        // Mark as closing to prevent new sends
+        client.closing = true;
 
-        // Free in-flight send buffer
-        if (client.send_buffer) |buf| {
-            self.allocator.free(buf);
-            client.send_buffer = null;
-        }
-
-        client.attached_sessions.deinit(self.allocator);
-        // client.style_cache.deinit();
-
-        for (self.clients.items, 0..) |c, i| {
-            if (c == client) {
-                _ = self.clients.swapRemove(i);
-                break;
-            }
-        }
-
-        // Cancel any pending tasks for this client's FD before closing it
+        // Cancel pending recv on this client's FD
         self.loop.cancelByFd(client.fd);
 
-        _ = self.loop.close(client.fd, .{
-            .ptr = null,
-            .cb = struct {
-                fn noop(_: *io.Loop, _: io.Completion) anyerror!void {}
-            }.noop,
-        }) catch {};
-        self.allocator.destroy(client);
-        std.log.debug("Total clients: {}", .{self.clients.items.len});
-        self.checkExit() catch {};
+        // If there's an in-flight send, let onSendComplete finish cleanup
+        if (client.send_buffer != null) {
+            return;
+        }
+
+        // No in-flight send, clean up immediately
+        client.finishClose(self.loop);
     }
 
     /// Send redraw notification (bytes) to attached clients
