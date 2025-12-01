@@ -169,6 +169,7 @@ pub const ClientState = struct {
     connection_refused: bool = false,
     next_msgid: u32 = 1,
     pending_requests: std.AutoHashMap(u32, RequestInfo),
+    pwd_map: std.AutoHashMap(i64, []const u8),
     allocator: std.mem.Allocator,
     prefix_mode: bool = false,
 
@@ -182,11 +183,17 @@ pub const ClientState = struct {
         return .{
             .allocator = allocator,
             .pending_requests = std.AutoHashMap(u32, RequestInfo).init(allocator),
+            .pwd_map = std.AutoHashMap(i64, []const u8).init(allocator),
         };
     }
 
     pub fn deinit(self: *ClientState) void {
         self.pending_requests.deinit();
+        var it = self.pwd_map.valueIterator();
+        while (it.next()) |val| {
+            self.allocator.free(val.*);
+        }
+        self.pwd_map.deinit();
     }
 };
 
@@ -299,6 +306,35 @@ pub const ClientLogic = struct {
                             else => 0,
                         };
                         return .{ .pty_exited = .{ .pty_id = pty_id, .status = status } };
+                    }
+                } else if (std.mem.eql(u8, notif.method, "pwd_changed")) {
+                    if (notif.params == .map) {
+                        var pty_id_val: ?msgpack.Value = null;
+                        var pwd_val: ?msgpack.Value = null;
+                        for (notif.params.map) |kv| {
+                            if (kv.key == .string) {
+                                if (std.mem.eql(u8, kv.key.string, "pty_id")) {
+                                    pty_id_val = kv.value;
+                                } else if (std.mem.eql(u8, kv.key.string, "pwd")) {
+                                    pwd_val = kv.value;
+                                }
+                            }
+                        }
+                        if (pty_id_val) |pty_id_v| {
+                            const pty_id = switch (pty_id_v) {
+                                .integer => |i| @as(i64, @intCast(i)),
+                                .unsigned => |u| @as(i64, @intCast(u)),
+                                else => return .none,
+                            };
+                            if (pwd_val) |pwd_v| {
+                                if (pwd_v == .string) {
+                                    if (state.pwd_map.getPtr(pty_id)) |entry| {
+                                        state.allocator.free(entry.*);
+                                    }
+                                    state.pwd_map.put(pty_id, try state.allocator.dupe(u8, pwd_v.string)) catch return .none;
+                                }
+                            }
+                        }
                     }
                 }
             },
@@ -1964,8 +2000,13 @@ pub const App = struct {
         try self.sendDirect(msg);
     }
 
+    fn pwdLookup(ctx: *anyopaque, id: i64) ?[]const u8 {
+        const self: *App = @ptrCast(@alignCast(ctx));
+        return self.state.pwd_map.get(id);
+    }
+
     pub fn saveSession(self: *App, name: []const u8) !void {
-        const json = try self.ui.getStateJson();
+        const json = try self.ui.getStateJson(&pwdLookup, self);
         defer self.allocator.free(json);
 
         const home = std.posix.getenv("HOME") orelse return error.NoHomeDirectory;

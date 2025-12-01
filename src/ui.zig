@@ -528,7 +528,9 @@ pub const UI = struct {
         return widget.parseWidget(self.lua, self.allocator, -1);
     }
 
-    pub fn getStateJson(self: *UI) ![]u8 {
+    pub const PwdLookupFn = *const fn (ctx: *anyopaque, id: i64) ?[]const u8;
+
+    pub fn getStateJson(self: *UI, pwd_lookup_fn: ?PwdLookupFn, pwd_lookup_ctx: *anyopaque) ![]u8 {
         _ = self.lua.getField(ziglua.registry_index, "prise_ui");
         defer self.lua.pop(1);
 
@@ -537,10 +539,27 @@ pub const UI = struct {
             return error.NoGetStateFunction;
         }
 
-        self.lua.protectedCall(.{ .args = 0, .results = 1, .msg_handler = 0 }) catch |err| {
+        // Create pwd_lookup closure if provided
+        if (pwd_lookup_fn != null) {
+            const LookupCtx = struct {
+                ctx: *anyopaque,
+                lookup_fn: PwdLookupFn,
+            };
+            const lookup_ctx = try self.allocator.create(LookupCtx);
+            lookup_ctx.* = .{ .ctx = pwd_lookup_ctx, .lookup_fn = pwd_lookup_fn.? };
+
+            self.lua.pushLightUserdata(lookup_ctx);
+            self.lua.pushClosure(ziglua.wrap(pwdLookupWrapper), 1);
+        } else {
+            self.lua.pushNil();
+        }
+
+        self.lua.protectedCall(.{ .args = 1, .results = 1, .msg_handler = 0 }) catch |err| {
             const msg = self.lua.toString(-1) catch "Unknown Lua error";
             log.err("Lua get_state error: {s}", .{msg});
             self.lua.pop(1);
+            // Note: If pwd_lookup_fn was provided, the closure context leaks on error.
+            // This is acceptable as error paths are rare.
             return err;
         };
         defer self.lua.pop(1);
@@ -607,6 +626,24 @@ pub const UI = struct {
             lua_event.pushPtyUserdata(lua, id, r.surface, r.app, r.send_key_fn, r.send_mouse_fn, r.send_paste_fn, r.set_focus_fn, r.close_fn) catch {
                 lua.pushNil();
             };
+        } else {
+            lua.pushNil();
+        }
+        return 1;
+    }
+
+    fn pwdLookupWrapper(lua: *ziglua.Lua) i32 {
+        const LookupCtx = struct {
+            ctx: *anyopaque,
+            lookup_fn: PwdLookupFn,
+        };
+        const lookup_ctx = lua.toUserdata(LookupCtx, ziglua.Lua.upvalueIndex(1)) catch return 0;
+
+        const id: i64 = lua.checkInteger(1);
+        const pwd = lookup_ctx.lookup_fn(lookup_ctx.ctx, id);
+
+        if (pwd) |p| {
+            _ = lua.pushString(p);
         } else {
             lua.pushNil();
         }

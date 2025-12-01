@@ -364,21 +364,27 @@ end
 ---Serialize a node tree to a table with pty_ids instead of userdata
 ---@param node? Node
 ---@return table?
-local function serialize_node(node)
+local function serialize_node(node, pwd_lookup)
     if not node then
         return nil
     end
     if is_pane(node) then
+        local pty_id = node.pty:id()
+        local cwd = nil
+        if pwd_lookup then
+            cwd = pwd_lookup(pty_id)
+        end
         return {
             type = "pane",
             id = node.id,
-            pty_id = node.pty:id(),
+            pty_id = pty_id,
+            cwd = cwd,
             ratio = node.ratio,
         }
     elseif is_split(node) then
         local children = {}
         for _, child in ipairs(node.children) do
-            table.insert(children, serialize_node(child))
+            table.insert(children, serialize_node(child, pwd_lookup))
         end
         return {
             type = "split",
@@ -408,6 +414,7 @@ local function deserialize_node(saved, pty_lookup)
             type = "pane",
             id = saved.id,
             pty = pty,
+            cwd = saved.cwd, -- Store cwd for spawn fallback
             ratio = saved.ratio,
         }
     elseif saved.type == "split" then
@@ -1164,9 +1171,9 @@ function M.view()
 end
 
 ---@return table
-function M.get_state()
+function M.get_state(pwd_lookup)
     return {
-        root = serialize_node(state.root),
+        root = serialize_node(state.root, pwd_lookup),
         focused_id = state.focused_id,
         next_split_id = state.next_split_id,
     }
