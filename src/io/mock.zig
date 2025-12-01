@@ -125,6 +125,9 @@ pub const Loop = struct {
         buf: []u8,
         ctx: root.Context,
     ) !root.Task {
+        // Precondition: buffer must have capacity to receive data
+        std.debug.assert(buf.len > 0);
+
         const id = self.next_id;
         self.next_id += 1;
 
@@ -144,6 +147,9 @@ pub const Loop = struct {
         buf: []u8,
         ctx: root.Context,
     ) !root.Task {
+        // Precondition: buffer must have capacity to receive data
+        std.debug.assert(buf.len > 0);
+
         const id = self.next_id;
         self.next_id += 1;
 
@@ -163,6 +169,9 @@ pub const Loop = struct {
         buf: []const u8,
         ctx: root.Context,
     ) !root.Task {
+        // Precondition: must have data to send
+        std.debug.assert(buf.len > 0);
+
         const id = self.next_id;
         self.next_id += 1;
 

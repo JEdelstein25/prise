@@ -49,6 +49,12 @@ pub const Process = struct {
         env: ?[]const []const u8,
         cwd: ?[]const u8,
     ) OpenError!Process {
+        // Precondition: terminal size must be positive (zero crashes terminal emulators)
+        std.debug.assert(size.ws_row > 0);
+        std.debug.assert(size.ws_col > 0);
+        // Precondition: must have at least one argv element (the program to run)
+        std.debug.assert(argv.len > 0);
+
         var master_fd: c_int = undefined;
         var slave_fd: c_int = undefined;
 
@@ -196,6 +202,12 @@ pub const Process = struct {
     }
 
     pub fn setSize(self: *Process, size: winsize) !void {
+        // Precondition: dimensions must be positive
+        std.debug.assert(size.ws_row > 0);
+        std.debug.assert(size.ws_col > 0);
+        // Precondition: master fd must be valid (not closed)
+        std.debug.assert(self.master >= 0);
+
         if (c.ioctl(self.master, TIOCSWINSZ, @intFromPtr(&size)) < 0) {
             return error.IoctlFailed;
         }

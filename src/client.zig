@@ -132,6 +132,11 @@ pub fn connectUnixSocket(
     socket_path: []const u8,
     ctx: io.Context,
 ) !*UnixSocketClient {
+    // Precondition: socket path must fit in sockaddr_un.path (typically 104 bytes on macOS)
+    std.debug.assert(socket_path.len < 104);
+    // Precondition: socket path must not be empty
+    std.debug.assert(socket_path.len > 0);
+
     const client = try loop.allocator.create(UnixSocketClient);
     errdefer loop.allocator.destroy(client);
 

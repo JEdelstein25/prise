@@ -965,11 +965,17 @@ pub const Decoder = struct {
 };
 
 pub fn decode(allocator: Allocator, data: []const u8) !Value {
+    // Precondition: data must not be empty (nothing to decode)
+    std.debug.assert(data.len > 0);
+
     var decoder = Decoder.init(allocator, data);
     return decoder.decode();
 }
 
 pub fn decodeTyped(allocator: Allocator, data: []const u8, comptime T: type) !T {
+    // Precondition: data must not be empty
+    std.debug.assert(data.len > 0);
+
     var decoder = Decoder.init(allocator, data);
     return decoder.decodeTyped(T);
 }

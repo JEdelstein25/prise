@@ -31,6 +31,10 @@ selection: ?struct {
 } = null,
 
 pub fn init(allocator: std.mem.Allocator, pty_id: u32, rows: u16, cols: u16) !Surface {
+    // Precondition: dimensions must be positive to create valid screen buffers
+    std.debug.assert(rows > 0);
+    std.debug.assert(cols > 0);
+
     const front = try allocator.create(vaxis.AllocatingScreen);
     errdefer allocator.destroy(front);
 
@@ -96,6 +100,10 @@ pub fn isCellSelected(self: *const Surface, row: u16, col: u16) bool {
 }
 
 pub fn resize(self: *Surface, rows: u16, cols: u16) !void {
+    // Precondition: dimensions must be positive
+    std.debug.assert(rows > 0);
+    std.debug.assert(cols > 0);
+
     // Create new screens first
     var new_front = try vaxis.AllocatingScreen.init(self.allocator, cols, rows);
     errdefer new_front.deinit(self.allocator);
