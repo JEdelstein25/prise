@@ -56,6 +56,15 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&test_cmd.step);
 
+    const check_fmt = b.addSystemCommand(&.{
+        "sh", "-c",
+        \\zig fmt --check src build.zig && stylua --check src/lua || {
+        \\  echo ""; echo "Format check failed. Run 'zig build fmt' to fix."; exit 1;
+        \\}
+        ,
+    });
+    test_step.dependOn(&check_fmt.step);
+
     const fmt_step = b.step("fmt", "Format Zig and Lua files");
 
     const fmt_zig = b.addFmt(.{
