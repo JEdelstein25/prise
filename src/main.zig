@@ -4,6 +4,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const io = @import("io.zig");
+const msgpack = @import("msgpack.zig");
+const rpc = @import("rpc.zig");
 const server = @import("server.zig");
 const client = @import("client.zig");
 const posix = std.posix;
@@ -108,7 +110,7 @@ fn parseArgs(allocator: std.mem.Allocator, socket_path: []const u8) !?(?[]const 
     } else if (std.mem.eql(u8, cmd, "session")) {
         return try handleSessionCommand(allocator, &args);
     } else if (std.mem.eql(u8, cmd, "pty")) {
-        return try handlePtyCommand(&args);
+        return try handlePtyCommand(allocator, &args, socket_path);
     } else {
         log.err("Unknown command: {s}", .{cmd});
         log.err("Available commands: serve, session, pty", .{});
@@ -135,14 +137,19 @@ fn handleSessionCommand(allocator: std.mem.Allocator, args: *std.process.ArgIter
     }
 }
 
-fn handlePtyCommand(args: *std.process.ArgIterator) !?(?[]const u8) {
-    if (args.next()) |subcmd| {
-        _ = subcmd;
-        log.err("pty commands not yet implemented", .{});
-        return error.NotImplemented;
-    } else {
-        log.err("Missing pty command. Available commands: spawn, capture, kill", .{});
+fn handlePtyCommand(allocator: std.mem.Allocator, args: *std.process.ArgIterator, socket_path: []const u8) !?(?[]const u8) {
+    const subcmd = args.next() orelse {
+        log.err("Missing pty command. Available commands: list, kill", .{});
         return error.MissingCommand;
+    };
+
+    if (std.mem.eql(u8, subcmd, "list")) {
+        try listPtys(allocator, socket_path);
+        return null;
+    } else {
+        log.err("Unknown pty command: {s}", .{subcmd});
+        log.err("Available commands: list, kill", .{});
+        return error.UnknownCommand;
     }
 }
 
@@ -225,6 +232,108 @@ fn listSessions(allocator: std.mem.Allocator) !void {
 
     if (count == 0) {
         try stdout.interface.print("No sessions found.\n", .{});
+    }
+}
+
+fn listPtys(allocator: std.mem.Allocator, socket_path: []const u8) !void {
+    var buf: [4096]u8 = undefined;
+    var stdout = std.fs.File.stdout().writer(&buf);
+    defer stdout.interface.flush() catch {};
+
+    const sock = posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0) catch |err| {
+        log.err("Failed to create socket: {}", .{err});
+        return error.SocketError;
+    };
+    defer posix.close(sock);
+
+    var addr: posix.sockaddr.un = .{ .path = undefined };
+    @memcpy(addr.path[0..socket_path.len], socket_path);
+    addr.path[socket_path.len] = 0;
+
+    posix.connect(sock, @ptrCast(&addr), @sizeOf(posix.sockaddr.un)) catch |err| {
+        if (err == error.ConnectionRefused or err == error.FileNotFound) {
+            try stdout.interface.print("Server not running.\n", .{});
+            return;
+        }
+        return err;
+    };
+
+    const request = try msgpack.encode(allocator, .{ 0, 1, "list_ptys", .{} });
+    defer allocator.free(request);
+
+    _ = try posix.write(sock, request);
+
+    var response_buf: [16384]u8 = undefined;
+    const n = try posix.read(sock, &response_buf);
+    if (n == 0) {
+        try stdout.interface.print("No response from server.\n", .{});
+        return;
+    }
+
+    const msg = rpc.decodeMessage(allocator, response_buf[0..n]) catch |err| {
+        log.err("Failed to decode response: {}", .{err});
+        return error.DecodeError;
+    };
+    defer msg.deinit(allocator);
+
+    if (msg != .response) {
+        try stdout.interface.print("Unexpected response type.\n", .{});
+        return;
+    }
+
+    if (msg.response.err) |err_val| {
+        const err_str = if (err_val == .string) err_val.string else "unknown error";
+        try stdout.interface.print("Server error: {s}\n", .{err_str});
+        return;
+    }
+
+    const result = msg.response.result;
+    if (result != .map) {
+        try stdout.interface.print("Invalid response format.\n", .{});
+        return;
+    }
+
+    var ptys: ?[]const msgpack.Value = null;
+    for (result.map) |kv| {
+        if (kv.key == .string and std.mem.eql(u8, kv.key.string, "ptys")) {
+            if (kv.value == .array) {
+                ptys = kv.value.array;
+            }
+        }
+    }
+
+    if (ptys == null or ptys.?.len == 0) {
+        try stdout.interface.print("No PTYs running.\n", .{});
+        return;
+    }
+
+    for (ptys.?) |pty_val| {
+        if (pty_val != .map) continue;
+
+        var id: ?u64 = null;
+        var cwd: []const u8 = "";
+        var title: []const u8 = "";
+        var clients: u64 = 0;
+
+        for (pty_val.map) |kv| {
+            if (kv.key != .string) continue;
+            const key = kv.key.string;
+
+            if (std.mem.eql(u8, key, "id")) {
+                id = if (kv.value == .unsigned) kv.value.unsigned else null;
+            } else if (std.mem.eql(u8, key, "cwd")) {
+                cwd = if (kv.value == .string) kv.value.string else "";
+            } else if (std.mem.eql(u8, key, "title")) {
+                title = if (kv.value == .string) kv.value.string else "";
+            } else if (std.mem.eql(u8, key, "attached_client_count")) {
+                clients = if (kv.value == .unsigned) kv.value.unsigned else 0;
+            }
+        }
+
+        if (id) |pty_id| {
+            const title_display = if (title.len > 0) title else "(no title)";
+            try stdout.interface.print("{d}: {s} [{s}] ({d} clients)\n", .{ pty_id, cwd, title_display, clients });
+        }
     }
 }
 

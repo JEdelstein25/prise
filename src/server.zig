@@ -2353,11 +2353,57 @@ const Server = struct {
         return .{ .map = entries };
     }
 
+    fn handleListPtys(self: *Server) !msgpack.Value {
+        const pty_count = self.ptys.count();
+        const ptys_array = try self.allocator.alloc(msgpack.Value, pty_count);
+        errdefer self.allocator.free(ptys_array);
+
+        var i: usize = 0;
+        var iter = self.ptys.iterator();
+        while (iter.next()) |entry| {
+            const pty_instance = entry.value_ptr.*;
+            const pty_entries = try self.allocator.alloc(msgpack.Value.KeyValue, 4);
+
+            pty_entries[0] = .{
+                .key = .{ .string = try self.allocator.dupe(u8, "id") },
+                .value = .{ .unsigned = @intCast(pty_instance.id) },
+            };
+            pty_entries[1] = .{
+                .key = .{ .string = try self.allocator.dupe(u8, "cwd") },
+                .value = .{ .string = try self.allocator.dupe(u8, pty_instance.cwd.items) },
+            };
+            pty_entries[2] = .{
+                .key = .{ .string = try self.allocator.dupe(u8, "title") },
+                .value = .{ .string = try self.allocator.dupe(u8, pty_instance.title.items) },
+            };
+            pty_entries[3] = .{
+                .key = .{ .string = try self.allocator.dupe(u8, "attached_client_count") },
+                .value = .{ .unsigned = @intCast(pty_instance.clients.items.len) },
+            };
+
+            ptys_array[i] = .{ .map = pty_entries };
+            i += 1;
+        }
+
+        const result_entries = try self.allocator.alloc(msgpack.Value.KeyValue, 2);
+        result_entries[0] = .{
+            .key = .{ .string = try self.allocator.dupe(u8, "pty_validity") },
+            .value = .{ .integer = self.start_time_ms },
+        };
+        result_entries[1] = .{
+            .key = .{ .string = try self.allocator.dupe(u8, "ptys") },
+            .value = .{ .array = ptys_array },
+        };
+        return .{ .map = result_entries };
+    }
+
     fn handleRequest(self: *Server, client: *Client, method: []const u8, params: msgpack.Value) !msgpack.Value {
         if (std.mem.eql(u8, method, "ping")) {
             return msgpack.Value{ .string = try self.allocator.dupe(u8, "pong") };
         } else if (std.mem.eql(u8, method, "get_server_info")) {
             return self.handleGetServerInfo();
+        } else if (std.mem.eql(u8, method, "list_ptys")) {
+            return self.handleListPtys();
         } else if (std.mem.eql(u8, method, "spawn_pty")) {
             return self.handleSpawnPty(client, params);
         } else if (std.mem.eql(u8, method, "close_pty")) {
