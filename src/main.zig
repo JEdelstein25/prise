@@ -130,9 +130,20 @@ fn handleSessionCommand(allocator: std.mem.Allocator, args: *std.process.ArgIter
     } else if (std.mem.eql(u8, subcmd, "list")) {
         try listSessions(allocator);
         return null;
+    } else if (std.mem.eql(u8, subcmd, "rename")) {
+        const old_name = args.next() orelse {
+            log.err("Usage: prise session rename <old-name> <new-name>", .{});
+            return error.MissingArgument;
+        };
+        const new_name = args.next() orelse {
+            log.err("Usage: prise session rename <old-name> <new-name>", .{});
+            return error.MissingArgument;
+        };
+        try renameSession(allocator, old_name, new_name);
+        return null;
     } else {
         log.err("Unknown session command: {s}", .{subcmd});
-        log.err("Available commands: attach, list", .{});
+        log.err("Available commands: attach, list, rename", .{});
         return error.UnknownCommand;
     }
 }
@@ -233,6 +244,53 @@ fn listSessions(allocator: std.mem.Allocator) !void {
     if (count == 0) {
         try stdout.interface.print("No sessions found.\n", .{});
     }
+}
+
+fn renameSession(allocator: std.mem.Allocator, old_name: []const u8, new_name: []const u8) !void {
+    var buf: [4096]u8 = undefined;
+    var stdout = std.fs.File.stdout().writer(&buf);
+    defer stdout.interface.flush() catch {};
+
+    const result = getSessionsDir(allocator) catch |err| {
+        if (err == error.NoSessionsFound) {
+            try stdout.interface.print("Session '{s}' not found.\n", .{old_name});
+            return error.SessionNotFound;
+        }
+        return err;
+    };
+    defer allocator.free(result.path);
+    var dir = result.dir;
+    defer dir.close();
+
+    var old_filename_buf: [256]u8 = undefined;
+    const old_filename = std.fmt.bufPrint(&old_filename_buf, "{s}.json", .{old_name}) catch {
+        try stdout.interface.print("Session name too long.\n", .{});
+        return error.NameTooLong;
+    };
+
+    var new_filename_buf: [256]u8 = undefined;
+    const new_filename = std.fmt.bufPrint(&new_filename_buf, "{s}.json", .{new_name}) catch {
+        try stdout.interface.print("Session name too long.\n", .{});
+        return error.NameTooLong;
+    };
+
+    dir.access(old_filename, .{}) catch {
+        try stdout.interface.print("Session '{s}' not found.\n", .{old_name});
+        return error.SessionNotFound;
+    };
+
+    dir.access(new_filename, .{}) catch |err| {
+        if (err != error.FileNotFound) return err;
+        dir.rename(old_filename, new_filename) catch |rename_err| {
+            try stdout.interface.print("Failed to rename session: {}\n", .{rename_err});
+            return rename_err;
+        };
+        try stdout.interface.print("Renamed session '{s}' to '{s}'.\n", .{ old_name, new_name });
+        return;
+    };
+
+    try stdout.interface.print("Session '{s}' already exists.\n", .{new_name});
+    return error.SessionAlreadyExists;
 }
 
 fn listPtys(allocator: std.mem.Allocator, socket_path: []const u8) !void {

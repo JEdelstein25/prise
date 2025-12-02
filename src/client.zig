@@ -900,6 +900,14 @@ pub const App = struct {
             }
         }.getNameCb);
 
+        // Register rename_session callback
+        self.ui.setRenameSessionCallback(self, struct {
+            fn renameCb(ctx: *anyopaque, new_name: []const u8) anyerror!void {
+                const app_ptr: *App = @ptrCast(@alignCast(ctx));
+                try app_ptr.renameCurrentSession(new_name);
+            }
+        }.renameCb);
+
         // Manually trigger initial resize to connect
         const ws = try vaxis.Tty.getWinsize(self.tty.fd);
         try self.handleVaxisEvent(.{ .winsize = ws });
@@ -2487,6 +2495,40 @@ pub const App = struct {
 
         try file.writeAll(final_json);
         log.info("Session saved to {s}", .{path});
+    }
+
+    pub fn renameCurrentSession(self: *App, new_name: []const u8) !void {
+        const old_name = self.current_session_name orelse return error.NoCurrentSession;
+
+        const home = std.posix.getenv("HOME") orelse return error.NoHomeDirectory;
+        const state_dir = try std.fs.path.join(self.allocator, &.{ home, ".local", "state", "prise", "sessions" });
+        defer self.allocator.free(state_dir);
+
+        var dir = std.fs.openDirAbsolute(state_dir, .{}) catch |err| {
+            if (err == error.FileNotFound) return error.SessionNotFound;
+            return err;
+        };
+        defer dir.close();
+
+        const old_filename = try std.fmt.allocPrint(self.allocator, "{s}.json", .{old_name});
+        defer self.allocator.free(old_filename);
+
+        const new_filename = try std.fmt.allocPrint(self.allocator, "{s}.json", .{new_name});
+        defer self.allocator.free(new_filename);
+
+        dir.access(new_filename, .{}) catch |err| {
+            if (err != error.FileNotFound) return err;
+            dir.rename(old_filename, new_filename) catch |rename_err| {
+                return rename_err;
+            };
+            // Update current session name
+            self.allocator.free(old_name);
+            self.current_session_name = try self.allocator.dupe(u8, new_name);
+            log.info("Renamed session '{s}' to '{s}'", .{ old_name, new_name });
+            return;
+        };
+
+        return error.SessionAlreadyExists;
     }
 
     const AUTOSAVE_DELAY_MS = 1000;
