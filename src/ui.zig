@@ -310,32 +310,112 @@ pub const UI = struct {
         return 0;
     }
 
+    /// Amory Wars universe names for session generation
+    const AMORY_NAMES = [_][]const u8{
+        // Characters
+        "ambellina",
+        "inferno",
+        "sirius",
+        "coheed",
+        "cambria",
+        "josephine",
+        "newo",
+        "ikkin",
+        "apollo",
+        "wilhelm",
+        "jesse",
+        "mayo",
+        "meri",
+        "chase",
+        "mariah",
+        "sizer",
+        "ryder",
+        "creature",
+        "spider",
+        "nostrand",
+        "colten",
+        "paranoia",
+        "tenspeed",
+        // Places
+        "keywork",
+        "saratoga",
+        "kalline",
+        "hetricus",
+        "apity",
+        "sentencer",
+        "fence",
+        "fiction",
+        // Songs and concepts
+        "velorium",
+        "camper",
+        "gravemakers",
+        "crowing",
+        "domino",
+        "delirium",
+        "willing",
+        "sentry",
+        "feathers",
+        "apollo",
+        "evagria",
+        "afterman",
+        "descension",
+        "ascension",
+        "neverender",
+        "turbine",
+        "irobot",
+        "monstar",
+        "suffering",
+        "bloodred",
+        "gravity",
+        "shoulders",
+        "comatose",
+        "liars",
+        "embers",
+        "ladders",
+        "naianasha",
+        "window",
+        "saudade",
+        // Vaxis series
+        "sonny",
+        "candelaria",
+        "yuko",
+        "melvin",
+        "shiloh",
+        "continuum",
+        "sunshine",
+        "tethered",
+        "allmother",
+        "gutter",
+        "pavilion",
+        "walkers",
+    };
+
     fn nextSessionName(lua: *ziglua.Lua) i32 {
         _ = lua.getField(ziglua.registry_index, "prise_ui_ptr");
         const ui = lua.toUserdata(UI, -1) catch {
-            _ = lua.pushString("0");
+            _ = lua.pushString(AMORY_NAMES[0]);
             return 1;
         };
         lua.pop(1);
 
         const home = std.posix.getenv("HOME") orelse {
-            _ = lua.pushString("0");
+            _ = lua.pushString(AMORY_NAMES[0]);
             return 1;
         };
 
         const sessions_dir = std.fs.path.join(ui.allocator, &.{ home, ".local", "state", "prise", "sessions" }) catch {
-            _ = lua.pushString("0");
+            _ = lua.pushString(AMORY_NAMES[0]);
             return 1;
         };
         defer ui.allocator.free(sessions_dir);
 
         var dir = std.fs.openDirAbsolute(sessions_dir, .{ .iterate = true }) catch {
-            _ = lua.pushString("0");
+            _ = lua.pushString(AMORY_NAMES[0]);
             return 1;
         };
         defer dir.close();
 
-        var used = std.AutoHashMap(u32, void).init(ui.allocator);
+        var used = std.StringHashMap(void).init(ui.allocator);
         defer used.deinit();
 
         var iter = dir.iterate();
@@ -344,16 +424,29 @@ pub const UI = struct {
             const name = entry.name;
             if (!std.mem.endsWith(u8, name, ".json")) continue;
             const base = name[0 .. name.len - 5];
-            const num = std.fmt.parseInt(u32, base, 10) catch continue;
-            used.put(num, {}) catch continue;
+            used.put(base, {}) catch continue;
         }
 
-        var next: u32 = 0;
-        while (used.contains(next)) : (next += 1) {}
+        // Find first unused name from the list
+        for (AMORY_NAMES) |name| {
+            if (!used.contains(name)) {
+                _ = lua.pushString(name);
+                return 1;
+            }
+        }
 
-        var buf: [16]u8 = undefined;
-        const name_str = std.fmt.bufPrint(&buf, "{d}", .{next}) catch "0";
-        _ = lua.pushString(name_str);
+        // All names used - append number to first name
+        var suffix: u32 = 2;
+        var buf: [32]u8 = undefined;
+        while (suffix < 1000) : (suffix += 1) {
+            const suffixed = std.fmt.bufPrint(&buf, "{s}-{d}", .{ AMORY_NAMES[0], suffix }) catch break;
+            if (!used.contains(suffixed)) {
+                _ = lua.pushString(suffixed);
+                return 1;
+            }
+        }
+
+        _ = lua.pushString(AMORY_NAMES[0]);
         return 1;
     }
 
