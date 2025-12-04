@@ -44,6 +44,7 @@ local prise = require("prise")
 ---@field name string
 ---@field action fun()
 ---@field shortcut? string
+---@field visible? fun(): boolean
 
 -- Powerline symbols
 local POWERLINE_SYMBOLS = {
@@ -1028,19 +1029,146 @@ local commands = {
             prise.quit()
         end,
     },
+    {
+        name = "Resize Left",
+        shortcut = key_prefix .. " H",
+        action = function()
+            resize_pane("width", -RESIZE_STEP)
+        end,
+    },
+    {
+        name = "Resize Right",
+        shortcut = key_prefix .. " L",
+        action = function()
+            resize_pane("width", RESIZE_STEP)
+        end,
+    },
+    {
+        name = "Resize Up",
+        shortcut = key_prefix .. " K",
+        action = function()
+            resize_pane("height", -RESIZE_STEP)
+        end,
+    },
+    {
+        name = "Resize Down",
+        shortcut = key_prefix .. " J",
+        action = function()
+            resize_pane("height", RESIZE_STEP)
+        end,
+    },
+    {
+        name = "Tab 1",
+        shortcut = key_prefix .. " 1",
+        action = function()
+            set_active_tab_index(1)
+        end,
+        visible = function()
+            return #state.tabs >= 1
+        end,
+    },
+    {
+        name = "Tab 2",
+        shortcut = key_prefix .. " 2",
+        action = function()
+            set_active_tab_index(2)
+        end,
+        visible = function()
+            return #state.tabs >= 2
+        end,
+    },
+    {
+        name = "Tab 3",
+        shortcut = key_prefix .. " 3",
+        action = function()
+            set_active_tab_index(3)
+        end,
+        visible = function()
+            return #state.tabs >= 3
+        end,
+    },
+    {
+        name = "Tab 4",
+        shortcut = key_prefix .. " 4",
+        action = function()
+            set_active_tab_index(4)
+        end,
+        visible = function()
+            return #state.tabs >= 4
+        end,
+    },
+    {
+        name = "Tab 5",
+        shortcut = key_prefix .. " 5",
+        action = function()
+            set_active_tab_index(5)
+        end,
+        visible = function()
+            return #state.tabs >= 5
+        end,
+    },
+    {
+        name = "Tab 6",
+        shortcut = key_prefix .. " 6",
+        action = function()
+            set_active_tab_index(6)
+        end,
+        visible = function()
+            return #state.tabs >= 6
+        end,
+    },
+    {
+        name = "Tab 7",
+        shortcut = key_prefix .. " 7",
+        action = function()
+            set_active_tab_index(7)
+        end,
+        visible = function()
+            return #state.tabs >= 7
+        end,
+    },
+    {
+        name = "Tab 8",
+        shortcut = key_prefix .. " 8",
+        action = function()
+            set_active_tab_index(8)
+        end,
+        visible = function()
+            return #state.tabs >= 8
+        end,
+    },
+    {
+        name = "Tab 9",
+        shortcut = key_prefix .. " 9",
+        action = function()
+            set_active_tab_index(9)
+        end,
+        visible = function()
+            return #state.tabs >= 9
+        end,
+    },
+    {
+        name = "Tab 10",
+        shortcut = key_prefix .. " 0",
+        action = function()
+            set_active_tab_index(10)
+        end,
+        visible = function()
+            return #state.tabs >= 10
+        end,
+    },
 }
 
 ---@param query string
 ---@return Command[]
 local function filter_commands(query)
-    if not query or query == "" then
-        return commands
-    end
-    local q = query:lower()
     local results = {}
     for _, cmd in ipairs(commands) do
-        if cmd.name:lower():find(q, 1, true) then
-            table.insert(results, cmd)
+        local is_visible = not cmd.visible or cmd.visible()
+        if is_visible then
+            if not query or query == "" or cmd.name:lower():find(query:lower(), 1, true) then
+                table.insert(results, cmd)
+            end
         end
     end
     return results
