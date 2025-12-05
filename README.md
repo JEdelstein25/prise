@@ -1,5 +1,8 @@
 # Prise
 
+> [!WARNING]
+> Prise is alpha software under active development. Expect breaking changes, incomplete features, and rough edges.
+
 Prise is a terminal multiplexer targeted at modern terminals.
 
 <p align="center">
