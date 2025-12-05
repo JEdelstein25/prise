@@ -1650,8 +1650,14 @@ function M.update(event)
                 if click_x >= palette_start_x and click_x < palette_end_x then
                     for _, region in ipairs(state.palette.regions) do
                         if click_y >= region.start_y and click_y < region.end_y then
-                            state.palette.selected = region.index
-                            execute_selected()
+                            if state.palette.selected == region.index then
+                                -- Already selected, execute it
+                                execute_selected()
+                            else
+                                -- First click, just highlight it
+                                state.palette.selected = region.index
+                                prise.request_frame()
+                            end
                             return
                         end
                     end
