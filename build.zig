@@ -16,19 +16,17 @@ pub fn build(b: *std.Build) void {
     options.addOption([]const u8, "version", version);
     exe_mod.addOptions("build_options", options);
 
-    if (b.lazyDependency("ghostty", .{
+    const ghostty = b.dependency("ghostty", .{
         .target = target,
         .optimize = optimize,
-    })) |dep| {
-        exe_mod.addImport("ghostty-vt", dep.module("ghostty-vt"));
-    }
+    });
+    exe_mod.addImport("ghostty-vt", ghostty.module("ghostty-vt"));
 
-    if (b.lazyDependency("vaxis", .{
+    const vaxis = b.dependency("vaxis", .{
         .target = target,
         .optimize = optimize,
-    })) |dep| {
-        exe_mod.addImport("vaxis", dep.module("vaxis"));
-    }
+    });
+    exe_mod.addImport("vaxis", vaxis.module("vaxis"));
 
     const zlua = b.dependency("zlua", .{
         .target = target,
