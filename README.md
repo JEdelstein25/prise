@@ -14,7 +14,7 @@ Prise is a terminal multiplexer targeted at modern terminals.
 ### Homebrew (macOS)
 
 ```bash
-brew tap rockorager/prise
+brew tap rockorager/tap
 brew install prise
 brew services start prise
 ```
