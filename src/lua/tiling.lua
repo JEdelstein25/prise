@@ -2282,6 +2282,14 @@ function M.view()
     return main_ui
 end
 
+---Create a split from external source (e.g., CLI)
+---@param direction string "row" for horizontal split, "col" for vertical split
+function M.create_split(direction)
+    local pty = get_focused_pty()
+    state.pending_split = { direction = direction }
+    prise.spawn({ cwd = pty and pty:cwd() })
+end
+
 ---@return table
 function M.get_state(cwd_lookup)
     -- Serialize all tabs

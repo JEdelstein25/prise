@@ -1,5 +1,31 @@
 # Agent Instructions
 
+## Prise CLI
+
+Prise is a terminal multiplexer. Use these commands to interact with running PTYs:
+
+```bash
+# Check server status and list PTYs
+prise status
+
+# List running PTYs
+prise pty list
+
+# Send input to a PTY (supports \n, \r, \t escapes)
+prise pty send <id> "echo hello\n"
+
+# Kill a PTY
+prise pty kill <id>
+
+# List saved sessions
+prise session list
+
+# Show ASCII layout of a session
+prise show <session-name>
+```
+
+The server runs at `/tmp/prise-<uid>.sock` using msgpack RPC.
+
 ## Zig Development
 
 Always use `zigdoc` to discover APIs for the Zig standard library AND any third-party dependencies (modules). Assume training data is out of date.

@@ -235,6 +235,28 @@ pub const UI = struct {
         self.rename_session_callback = cb;
     }
 
+    /// Create a split in the UI by calling the Lua UI module's create_split function
+    pub fn createSplit(self: *UI, direction: []const u8) void {
+        const lua = self.lua;
+        // Get the UI table from registry (set by init.lua)
+        _ = lua.getField(ziglua.registry_index, "prise_ui");
+        if (!lua.isTable(-1)) {
+            lua.pop(1);
+            return;
+        }
+        _ = lua.getField(-1, "create_split");
+        if (!lua.isFunction(-1)) {
+            lua.pop(2);
+            return;
+        }
+        _ = lua.pushString(direction);
+        lua.protectedCall(.{ .args = 1, .results = 0, .msg_handler = 0 }) catch |err| {
+            log.err("Failed to call UI.create_split: {}", .{err});
+            lua.pop(1); // pop error message
+        };
+        lua.pop(1); // pop UI table
+    }
+
     pub fn getNextSessionName(self: *UI) ![]const u8 {
         const home = std.posix.getenv("HOME") orelse return self.allocator.dupe(u8, AMORY_NAMES[0]);
 

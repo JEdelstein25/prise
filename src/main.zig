@@ -247,10 +247,17 @@ fn printPtyHelpTo(file: std.fs.File) !void {
         \\
         \\Commands:
         \\  list                     List all PTYs
+        \\  spawn [options]          Spawn a new PTY or create a split
         \\  kill <id>                Kill a PTY by ID
+        \\  send <id> <text>         Send text input to a PTY
         \\
-        \\Options:
-        \\  -h, --help               Show this help message
+        \\Spawn options:
+        \\  --cwd <dir>              Working directory (orphaned PTY only)
+        \\  -v, --vertical           Create vertical split in active session
+        \\  -h, --horizontal         Create horizontal split in active session
+        \\
+        \\General options:
+        \\  --help                   Show this help message
         \\
     , .{});
 }
@@ -267,6 +274,30 @@ fn handlePtyCommand(allocator: std.mem.Allocator, args: *std.process.ArgIterator
     } else if (std.mem.eql(u8, subcmd, "list")) {
         try listPtys(allocator, socket_path);
         return null;
+    } else if (std.mem.eql(u8, subcmd, "spawn")) {
+        var cwd: ?[]const u8 = null;
+        var direction: []const u8 = "row"; // default: vertical split (side by side)
+        var use_split: bool = false;
+        while (args.next()) |arg| {
+            if (std.mem.eql(u8, arg, "--cwd")) {
+                cwd = args.next() orelse {
+                    std.fs.File.stderr().writeAll("Missing directory for --cwd\n") catch {};
+                    return error.MissingArgument;
+                };
+            } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--horizontal")) {
+                direction = "col";
+                use_split = true;
+            } else if (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--vertical")) {
+                direction = "row";
+                use_split = true;
+            }
+        }
+        if (use_split) {
+            try splitPane(allocator, socket_path, direction);
+        } else {
+            try spawnPty(allocator, socket_path, cwd);
+        }
+        return null;
     } else if (std.mem.eql(u8, subcmd, "kill")) {
         const id_str = args.next() orelse {
             std.fs.File.stderr().writeAll("Missing PTY ID. Usage: prise pty kill <id>\n\nUse 'prise pty list' to see available PTYs.\n") catch {};
@@ -279,6 +310,23 @@ fn handlePtyCommand(allocator: std.mem.Allocator, args: *std.process.ArgIterator
             return error.InvalidArgument;
         };
         try killPty(allocator, socket_path, pty_id);
+        return null;
+    } else if (std.mem.eql(u8, subcmd, "send")) {
+        const id_str = args.next() orelse {
+            std.fs.File.stderr().writeAll("Missing PTY ID. Usage: prise pty send <id> <text>\n") catch {};
+            return error.MissingArgument;
+        };
+        const pty_id = std.fmt.parseInt(u32, id_str, 10) catch {
+            var buf: [256]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "Invalid PTY ID: {s}\n", .{id_str}) catch return error.InvalidArgument;
+            std.fs.File.stderr().writeAll(msg) catch {};
+            return error.InvalidArgument;
+        };
+        const text = args.next() orelse {
+            std.fs.File.stderr().writeAll("Missing text. Usage: prise pty send <id> <text>\n") catch {};
+            return error.MissingArgument;
+        };
+        try sendPtyInput(allocator, socket_path, pty_id, text);
         return null;
     } else {
         var buf: [256]u8 = undefined;
@@ -642,7 +690,7 @@ fn killPty(allocator: std.mem.Allocator, socket_path: []const u8, pty_id: u32) !
         return err;
     };
 
-    const request = try msgpack.encode(allocator, .{ 0, 1, "close_pty", .{.{ "id", pty_id }} });
+    const request = try msgpack.encode(allocator, .{ 0, 1, "close_pty", .{pty_id} });
     defer allocator.free(request);
 
     _ = try posix.write(sock, request);
@@ -677,6 +725,234 @@ fn killPty(allocator: std.mem.Allocator, socket_path: []const u8, pty_id: u32) !
     }
 
     try stdout.interface.print("PTY {d} killed.\n", .{pty_id});
+}
+
+fn sendPtyInput(allocator: std.mem.Allocator, socket_path: []const u8, pty_id: u32, text: []const u8) !void {
+    var buf: [4096]u8 = undefined;
+    var stdout = std.fs.File.stdout().writer(&buf);
+    defer stdout.interface.flush() catch {};
+
+    const sock = posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0) catch |err| {
+        log.err("Failed to create socket: {}", .{err});
+        return error.SocketError;
+    };
+    defer posix.close(sock);
+
+    var addr: posix.sockaddr.un = .{ .path = undefined };
+    @memcpy(addr.path[0..socket_path.len], socket_path);
+    addr.path[socket_path.len] = 0;
+
+    posix.connect(sock, @ptrCast(&addr), @sizeOf(posix.sockaddr.un)) catch |err| {
+        if (err == error.ConnectionRefused or err == error.FileNotFound) {
+            try stdout.interface.print("Server not running.\n", .{});
+            return;
+        }
+        return err;
+    };
+
+    // Process escape sequences in text (e.g., \n -> newline)
+    var processed = std.ArrayList(u8).empty;
+    defer processed.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < text.len) {
+        if (i + 1 < text.len and text[i] == '\\') {
+            switch (text[i + 1]) {
+                'n' => {
+                    try processed.append(allocator, '\n');
+                    i += 2;
+                },
+                'r' => {
+                    try processed.append(allocator, '\r');
+                    i += 2;
+                },
+                't' => {
+                    try processed.append(allocator, '\t');
+                    i += 2;
+                },
+                '\\' => {
+                    try processed.append(allocator, '\\');
+                    i += 2;
+                },
+                else => {
+                    try processed.append(allocator, text[i]);
+                    i += 1;
+                },
+            }
+        } else {
+            try processed.append(allocator, text[i]);
+            i += 1;
+        }
+    }
+
+    // Send as notification: [2, "write_pty", [pty_id, data]]
+    const notification = try msgpack.encode(allocator, .{ 2, "write_pty", .{ pty_id, processed.items } });
+    defer allocator.free(notification);
+
+    _ = try posix.write(sock, notification);
+    try stdout.interface.print("Sent {d} bytes to PTY {d}\n", .{ processed.items.len, pty_id });
+}
+
+fn spawnPty(allocator: std.mem.Allocator, socket_path: []const u8, cwd: ?[]const u8) !void {
+    var buf: [4096]u8 = undefined;
+    var stdout = std.fs.File.stdout().writer(&buf);
+    defer stdout.interface.flush() catch {};
+
+    const sock = posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0) catch |err| {
+        log.err("Failed to create socket: {}", .{err});
+        return error.SocketError;
+    };
+    defer posix.close(sock);
+
+    var addr: posix.sockaddr.un = .{ .path = undefined };
+    @memcpy(addr.path[0..socket_path.len], socket_path);
+    addr.path[socket_path.len] = 0;
+
+    posix.connect(sock, @ptrCast(&addr), @sizeOf(posix.sockaddr.un)) catch |err| {
+        if (err == error.ConnectionRefused or err == error.FileNotFound) {
+            try stdout.interface.print("Server not running.\n", .{});
+            return;
+        }
+        return err;
+    };
+
+    // Build params map for spawn_pty
+    var params_list = std.ArrayList(msgpack.Value.KeyValue).empty;
+    defer params_list.deinit(allocator);
+
+    try params_list.append(allocator, .{
+        .key = .{ .string = "rows" },
+        .value = .{ .unsigned = 24 },
+    });
+    try params_list.append(allocator, .{
+        .key = .{ .string = "cols" },
+        .value = .{ .unsigned = 80 },
+    });
+    try params_list.append(allocator, .{
+        .key = .{ .string = "attach" },
+        .value = .{ .boolean = false },
+    });
+    if (cwd) |dir| {
+        try params_list.append(allocator, .{
+            .key = .{ .string = "cwd" },
+            .value = .{ .string = dir },
+        });
+    }
+
+    const params: msgpack.Value = .{ .map = params_list.items };
+    const request = try msgpack.encode(allocator, .{ 0, 1, "spawn_pty", params });
+    defer allocator.free(request);
+
+    _ = try posix.write(sock, request);
+
+    var response_buf: [16384]u8 = undefined;
+    const n = try posix.read(sock, &response_buf);
+    if (n == 0) {
+        try stdout.interface.print("No response from server.\n", .{});
+        return;
+    }
+
+    const msg = rpc.decodeMessage(allocator, response_buf[0..n]) catch |err| {
+        log.err("Failed to decode response: {}", .{err});
+        return error.DecodeError;
+    };
+    defer msg.deinit(allocator);
+
+    if (msg != .response) {
+        try stdout.interface.print("Unexpected response type.\n", .{});
+        return;
+    }
+
+    if (msg.response.err) |err_val| {
+        const err_str = if (err_val == .string) err_val.string else "unknown error";
+        try stdout.interface.print("Server error: {s}\n", .{err_str});
+        return;
+    }
+
+    // Response should contain pty_id
+    if (msg.response.result == .map) {
+        for (msg.response.result.map) |kv| {
+            if (kv.key == .string and std.mem.eql(u8, kv.key.string, "pty_id")) {
+                if (kv.value == .unsigned) {
+                    try stdout.interface.print("Spawned PTY {d}\n", .{kv.value.unsigned});
+                    return;
+                }
+            }
+        }
+    }
+
+    try stdout.interface.print("PTY spawned.\n", .{});
+}
+
+fn splitPane(allocator: std.mem.Allocator, socket_path: []const u8, direction: []const u8) !void {
+    var buf: [4096]u8 = undefined;
+    var stdout = std.fs.File.stdout().writer(&buf);
+    defer stdout.interface.flush() catch {};
+
+    const sock = posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0) catch |err| {
+        log.err("Failed to create socket: {}", .{err});
+        return error.SocketError;
+    };
+    defer posix.close(sock);
+
+    var addr: posix.sockaddr.un = .{ .path = undefined };
+    @memcpy(addr.path[0..socket_path.len], socket_path);
+    addr.path[socket_path.len] = 0;
+
+    posix.connect(sock, @ptrCast(&addr), @sizeOf(posix.sockaddr.un)) catch |err| {
+        if (err == error.ConnectionRefused or err == error.FileNotFound) {
+            try stdout.interface.print("Server not running.\n", .{});
+            return;
+        }
+        return err;
+    };
+
+    // Build params map for split_pane
+    var params_list = std.ArrayList(msgpack.Value.KeyValue).empty;
+    defer params_list.deinit(allocator);
+
+    try params_list.append(allocator, .{
+        .key = .{ .string = "direction" },
+        .value = .{ .string = direction },
+    });
+
+    const params: msgpack.Value = .{ .map = params_list.items };
+    const request = try msgpack.encode(allocator, .{ 0, 1, "split_pane", params });
+    defer allocator.free(request);
+
+    _ = try posix.write(sock, request);
+
+    var response_buf: [16384]u8 = undefined;
+    const n = try posix.read(sock, &response_buf);
+    if (n == 0) {
+        try stdout.interface.print("No response from server.\n", .{});
+        return;
+    }
+
+    const msg = rpc.decodeMessage(allocator, response_buf[0..n]) catch |err| {
+        log.err("Failed to decode response: {}", .{err});
+        return error.DecodeError;
+    };
+    defer msg.deinit(allocator);
+
+    if (msg != .response) {
+        try stdout.interface.print("Unexpected response type.\n", .{});
+        return;
+    }
+
+    if (msg.response.err) |err_val| {
+        const err_str = if (err_val == .string) err_val.string else "unknown error";
+        try stdout.interface.print("Server error: {s}\n", .{err_str});
+        return;
+    }
+
+    if (msg.response.result == .string) {
+        try stdout.interface.print("Error: {s}\n", .{msg.response.result.string});
+        return;
+    }
+
+    const dir_str = if (std.mem.eql(u8, direction, "col")) "horizontal" else "vertical";
+    try stdout.interface.print("Created {s} split.\n", .{dir_str});
 }
 
 fn showStatus(allocator: std.mem.Allocator, socket_path: []const u8) !void {
