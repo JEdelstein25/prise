@@ -112,6 +112,17 @@ fn parseArgs(allocator: std.mem.Allocator, socket_path: []const u8) !?(?[]const 
         return try handleSessionCommand(allocator, &args);
     } else if (std.mem.eql(u8, cmd, "pty")) {
         return try handlePtyCommand(allocator, &args, socket_path);
+    } else if (std.mem.eql(u8, cmd, "status")) {
+        try showStatus(allocator, socket_path);
+        return null;
+    } else if (std.mem.eql(u8, cmd, "show")) {
+        const name = args.next() orelse {
+            std.fs.File.stderr().writeAll("Missing session name. Usage: prise show <name>\n\nAvailable sessions:\n") catch {};
+            try listSessionsTo(allocator, std.fs.File.stderr());
+            return error.MissingArgument;
+        };
+        try showSessionVisual(allocator, name);
+        return null;
     } else {
         log.err("Unknown command: {s}", .{cmd});
         try printHelp();
@@ -138,6 +149,8 @@ fn printHelp() !void {
         \\Commands:
         \\  (none)     Start client, connect to server (spawns server if needed)
         \\  serve      Start the server in the foreground
+        \\  status     Show server status and running PTYs
+        \\  show       Show ASCII layout of a session
         \\  session    Manage sessions (attach, list, rename, delete)
         \\  pty        Manage PTYs (list, kill)
         \\
@@ -341,7 +354,7 @@ fn listSessions(allocator: std.mem.Allocator) !void {
 }
 
 fn listSessionsTo(allocator: std.mem.Allocator, file: std.fs.File) !void {
-    var buf: [4096]u8 = undefined;
+    var buf: [8192]u8 = undefined;
     var writer = file.writer(&buf);
     defer writer.interface.flush() catch {};
 
@@ -364,13 +377,63 @@ fn listSessionsTo(allocator: std.mem.Allocator, file: std.fs.File) !void {
         if (!std.mem.endsWith(u8, entry.name, ".json")) continue;
 
         const name_without_ext = entry.name[0 .. entry.name.len - 5];
-        try writer.interface.print("{s}\n", .{name_without_ext});
+
+        // Read session to get tab/pane counts
+        const info = getSessionInfo(allocator, dir, entry.name) catch {
+            try writer.interface.print("  {s}\n", .{name_without_ext});
+            count += 1;
+            continue;
+        };
+
+        try writer.interface.print("  {s: <18} {d} tab(s), {d} pane(s)\n", .{ name_without_ext, info.tab_count, info.pane_count });
         count += 1;
     }
 
     if (count == 0) {
         try writer.interface.print("No sessions found.\n", .{});
     }
+}
+
+const SessionInfo = struct {
+    tab_count: usize,
+    pane_count: usize,
+};
+
+fn getSessionInfo(allocator: std.mem.Allocator, dir: std.fs.Dir, filename: []const u8) !SessionInfo {
+    const file = try dir.openFile(filename, .{});
+    defer file.close();
+    const json = try file.readToEndAlloc(allocator, 1024 * 1024);
+    defer allocator.free(json);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+
+    var tab_count: usize = 0;
+    var pane_count: usize = 0;
+
+    if (parsed.value == .object) {
+        if (parsed.value.object.get("tabs")) |tabs| {
+            if (tabs == .array) {
+                tab_count = tabs.array.items.len;
+                for (tabs.array.items) |tab| {
+                    pane_count += countPanesInNode(tab);
+                }
+            }
+        }
+    }
+    return .{ .tab_count = tab_count, .pane_count = pane_count };
+}
+
+fn countPanesInNode(value: std.json.Value) usize {
+    if (value != .object) return 0;
+    const obj = value.object;
+    if (obj.get("type")) |t| if (t == .string and std.mem.eql(u8, t.string, "pane")) return 1;
+    if (obj.get("root")) |r| return countPanesInNode(r);
+    if (obj.get("children")) |ch| if (ch == .array) {
+        var n: usize = 0;
+        for (ch.array.items) |c| n += countPanesInNode(c);
+        return n;
+    };
+    return 0;
 }
 
 fn renameSession(allocator: std.mem.Allocator, old_name: []const u8, new_name: []const u8) !void {
@@ -614,6 +677,305 @@ fn killPty(allocator: std.mem.Allocator, socket_path: []const u8, pty_id: u32) !
     }
 
     try stdout.interface.print("PTY {d} killed.\n", .{pty_id});
+}
+
+fn showStatus(allocator: std.mem.Allocator, socket_path: []const u8) !void {
+    var buf: [16384]u8 = undefined;
+    var stdout = std.fs.File.stdout().writer(&buf);
+    defer stdout.interface.flush() catch {};
+
+    try stdout.interface.print("Prise Status\n", .{});
+    try stdout.interface.print("═════════════════════════════════════════\n\n", .{});
+
+    const sock = posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0) catch |err| {
+        log.err("Failed to create socket: {}", .{err});
+        try stdout.interface.print("Server: ✗ not running\n", .{});
+        return;
+    };
+    defer posix.close(sock);
+
+    var addr: posix.sockaddr.un = .{ .path = undefined };
+    @memcpy(addr.path[0..socket_path.len], socket_path);
+    addr.path[socket_path.len] = 0;
+
+    posix.connect(sock, @ptrCast(&addr), @sizeOf(posix.sockaddr.un)) catch |err| {
+        if (err == error.ConnectionRefused or err == error.FileNotFound) {
+            try stdout.interface.print("Server: ✗ not running\n\nSaved Sessions:\n", .{});
+            stdout.interface.flush() catch {};
+            try listSessionsTo(allocator, std.fs.File.stdout());
+            return;
+        }
+        return err;
+    };
+
+    try stdout.interface.print("Server: ✓ running ({s})\n\n", .{socket_path});
+
+    const request = try msgpack.encode(allocator, .{ 0, 1, "list_ptys", .{} });
+    defer allocator.free(request);
+    _ = try posix.write(sock, request);
+
+    var response_buf: [16384]u8 = undefined;
+    const n = try posix.read(sock, &response_buf);
+    if (n == 0) return;
+
+    const msg = rpc.decodeMessage(allocator, response_buf[0..n]) catch return;
+    defer msg.deinit(allocator);
+
+    if (msg != .response or msg.response.err != null) return;
+    if (msg.response.result != .map) return;
+
+    var ptys: ?[]const msgpack.Value = null;
+    for (msg.response.result.map) |kv| {
+        if (kv.key == .string and std.mem.eql(u8, kv.key.string, "ptys")) {
+            if (kv.value == .array) ptys = kv.value.array;
+        }
+    }
+
+    try stdout.interface.print("Running PTYs:\n", .{});
+    if (ptys == null or ptys.?.len == 0) {
+        try stdout.interface.print("  (none)\n", .{});
+    } else {
+        for (ptys.?) |pty_val| {
+            if (pty_val != .map) continue;
+            var id: ?u64 = null;
+            var cwd: []const u8 = "";
+            var title: []const u8 = "";
+            var clients: u64 = 0;
+
+            for (pty_val.map) |kv| {
+                if (kv.key != .string) continue;
+                const key = kv.key.string;
+                if (std.mem.eql(u8, key, "id")) {
+                    id = if (kv.value == .unsigned) kv.value.unsigned else null;
+                } else if (std.mem.eql(u8, key, "cwd")) {
+                    cwd = if (kv.value == .string) kv.value.string else "";
+                } else if (std.mem.eql(u8, key, "title")) {
+                    title = if (kv.value == .string) kv.value.string else "";
+                } else if (std.mem.eql(u8, key, "attached_client_count")) {
+                    clients = if (kv.value == .unsigned) kv.value.unsigned else 0;
+                }
+            }
+
+            if (id) |pty_id| {
+                const title_display = if (title.len > 0) title else "(no title)";
+                const indicator = if (clients > 0) "●" else "○";
+                const home = std.posix.getenv("HOME") orelse "";
+                if (home.len > 0 and std.mem.startsWith(u8, cwd, home)) {
+                    try stdout.interface.print("  {s} {d}: ~{s} [{s}] ({d} clients)\n", .{ indicator, pty_id, cwd[home.len..], title_display, clients });
+                } else {
+                    try stdout.interface.print("  {s} {d}: {s} [{s}] ({d} clients)\n", .{ indicator, pty_id, cwd, title_display, clients });
+                }
+            }
+        }
+    }
+
+    try stdout.interface.print("\nSaved Sessions:\n", .{});
+    stdout.interface.flush() catch {};
+    try listSessionsTo(allocator, std.fs.File.stdout());
+}
+
+const LayoutBox = struct {
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+    label: []const u8,
+    pty_id: i64,
+};
+
+fn showSessionVisual(allocator: std.mem.Allocator, name: []const u8) !void {
+    var buf: [32768]u8 = undefined;
+    var stdout = std.fs.File.stdout().writer(&buf);
+    defer stdout.interface.flush() catch {};
+
+    const result = getSessionsDir(allocator) catch |err| {
+        if (err == error.NoSessionsFound) {
+            try stdout.interface.print("Session '{s}' not found.\n", .{name});
+            return error.SessionNotFound;
+        }
+        return err;
+    };
+    defer allocator.free(result.path);
+    var dir = result.dir;
+    defer dir.close();
+
+    var filename_buf: [256]u8 = undefined;
+    const filename = std.fmt.bufPrint(&filename_buf, "{s}.json", .{name}) catch return error.NameTooLong;
+
+    const file = dir.openFile(filename, .{}) catch |err| {
+        if (err == error.FileNotFound) {
+            try stdout.interface.print("Session '{s}' not found.\n", .{name});
+            return error.SessionNotFound;
+        }
+        return err;
+    };
+    defer file.close();
+
+    const json = try file.readToEndAlloc(allocator, 1024 * 1024);
+    defer allocator.free(json);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+
+    if (parsed.value != .object) return error.InvalidFormat;
+
+    try stdout.interface.print("Session: {s}\n\n", .{name});
+
+    const obj = parsed.value.object;
+    var active_tab_idx: usize = 0;
+    if (obj.get("active_tab")) |at| {
+        if (at == .integer and at.integer > 0) active_tab_idx = @intCast(at.integer - 1);
+    }
+
+    if (obj.get("tabs")) |tabs_val| {
+        if (tabs_val == .array) {
+            for (tabs_val.array.items, 0..) |tab, i| {
+                try renderTabVisual(allocator, &stdout.interface, tab, i, i == active_tab_idx);
+            }
+        }
+    }
+}
+
+fn renderTabVisual(allocator: std.mem.Allocator, writer: anytype, tab: std.json.Value, index: usize, is_active: bool) !void {
+    if (tab != .object) return;
+    const active_marker = if (is_active) " ◀" else "";
+    try writer.print("Tab {d}{s}\n", .{ index + 1, active_marker });
+
+    if (tab.object.get("root")) |root_val| {
+        var boxes = std.ArrayList(LayoutBox).empty;
+        defer {
+            for (boxes.items) |b| allocator.free(b.label);
+            boxes.deinit(allocator);
+        }
+        const grid_width: usize = 60;
+        const grid_height: usize = 12;
+        try collectLayoutBoxes(allocator, &boxes, root_val, 0, 0, grid_width, grid_height);
+        try renderGrid(allocator, writer, boxes.items, grid_width, grid_height);
+    }
+    try writer.print("\n", .{});
+}
+
+fn collectLayoutBoxes(allocator: std.mem.Allocator, boxes: *std.ArrayList(LayoutBox), node: std.json.Value, x: usize, y: usize, width: usize, height: usize) !void {
+    if (node != .object) return;
+    const obj = node.object;
+
+    const type_str = if (obj.get("type")) |t| (if (t == .string) t.string else "unknown") else "unknown";
+
+    if (std.mem.eql(u8, type_str, "pane")) {
+        var pty_id: i64 = 0;
+        var cwd: []const u8 = "";
+        if (obj.get("pty_id")) |p| if (p == .integer) {
+            pty_id = p.integer;
+        };
+        if (obj.get("cwd")) |c| if (c == .string) {
+            cwd = c.string;
+        };
+
+        const home = std.posix.getenv("HOME") orelse "";
+        var label_buf: [64]u8 = undefined;
+        const label = if (home.len > 0 and std.mem.startsWith(u8, cwd, home))
+            std.fmt.bufPrint(&label_buf, "~{s}", .{cwd[home.len..]}) catch "~"
+        else
+            std.fmt.bufPrint(&label_buf, "{s}", .{cwd}) catch "";
+
+        try boxes.append(allocator, .{ .x = x, .y = y, .width = width, .height = height, .label = try allocator.dupe(u8, label), .pty_id = pty_id });
+    } else if (std.mem.eql(u8, type_str, "split")) {
+        const direction = if (obj.get("direction")) |d| (if (d == .string) d.string else "row") else "row";
+
+        if (obj.get("children")) |ch| {
+            if (ch == .array) {
+                const children = ch.array.items;
+                if (children.len == 0) return;
+
+                var ratios = try allocator.alloc(f64, children.len);
+                defer allocator.free(ratios);
+                var total: f64 = 0;
+                for (children, 0..) |child, i| {
+                    ratios[i] = 1.0;
+                    if (child == .object) if (child.object.get("ratio")) |r| if (r == .float) {
+                        ratios[i] = r.float;
+                    };
+                    total += ratios[i];
+                }
+                for (ratios) |*r| r.* /= total;
+
+                if (std.mem.eql(u8, direction, "row")) {
+                    var cx = x;
+                    for (children, 0..) |child, i| {
+                        const cw = @as(usize, @intFromFloat(@as(f64, @floatFromInt(width)) * ratios[i]));
+                        const aw = if (i == children.len - 1) (x + width - cx) else cw;
+                        try collectLayoutBoxes(allocator, boxes, child, cx, y, aw, height);
+                        cx += aw;
+                    }
+                } else {
+                    var cy = y;
+                    for (children, 0..) |child, i| {
+                        const ch_h = @as(usize, @intFromFloat(@as(f64, @floatFromInt(height)) * ratios[i]));
+                        const ah = if (i == children.len - 1) (y + height - cy) else ch_h;
+                        try collectLayoutBoxes(allocator, boxes, child, x, cy, width, ah);
+                        cy += ah;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn renderGrid(allocator: std.mem.Allocator, writer: anytype, boxes: []const LayoutBox, width: usize, height: usize) !void {
+    var grid = try allocator.alloc([]u8, height);
+    defer {
+        for (grid) |row| allocator.free(row);
+        allocator.free(grid);
+    }
+    for (grid) |*row| {
+        row.* = try allocator.alloc(u8, width);
+        @memset(row.*, ' ');
+    }
+
+    for (boxes) |box| {
+        if (box.width < 2 or box.height < 2) continue;
+        for (box.x..box.x + box.width) |col| {
+            if (col < width) {
+                if (box.y < height) grid[box.y][col] = '-';
+                if (box.y + box.height - 1 < height) grid[box.y + box.height - 1][col] = '-';
+            }
+        }
+        for (box.y..box.y + box.height) |row| {
+            if (row < height) {
+                if (box.x < width) grid[row][box.x] = '|';
+                if (box.x + box.width - 1 < width) grid[row][box.x + box.width - 1] = '|';
+            }
+        }
+        if (box.y < height and box.x < width) grid[box.y][box.x] = '+';
+        if (box.y < height and box.x + box.width - 1 < width) grid[box.y][box.x + box.width - 1] = '+';
+        if (box.y + box.height - 1 < height and box.x < width) grid[box.y + box.height - 1][box.x] = '+';
+        if (box.y + box.height - 1 < height and box.x + box.width - 1 < width) grid[box.y + box.height - 1][box.x + box.width - 1] = '+';
+
+        if (box.height >= 3 and box.width >= 4) {
+            const label_y = box.y + box.height / 2;
+            const max_len = box.width - 2;
+            var pty_buf: [16]u8 = undefined;
+            const pty_str = std.fmt.bufPrint(&pty_buf, "pty={d}", .{box.pty_id}) catch "";
+            const pty_start = box.x + 1 + (max_len - @min(pty_str.len, max_len)) / 2;
+            for (pty_str, 0..) |c, i| {
+                if (pty_start + i < box.x + box.width - 1 and label_y < height) grid[label_y][pty_start + i] = c;
+            }
+            if (box.height >= 5 and label_y > box.y + 1) {
+                const cwd_y = label_y - 1;
+                const dl = if (box.label.len > max_len) box.label[0..max_len] else box.label;
+                const ls = box.x + 1 + (max_len - dl.len) / 2;
+                for (dl, 0..) |c, i| {
+                    if (ls + i < box.x + box.width - 1 and cwd_y < height) grid[cwd_y][ls + i] = c;
+                }
+            }
+        }
+    }
+
+    for (grid) |row| {
+        var end: usize = row.len;
+        while (end > 0 and row[end - 1] == ' ') end -= 1;
+        try writer.print("{s}\n", .{row[0..end]});
+    }
 }
 
 fn findMostRecentSession(allocator: std.mem.Allocator) ![]const u8 {
