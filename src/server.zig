@@ -2377,6 +2377,40 @@ const Server = struct {
         return msgpack.Value.nil;
     }
 
+    fn handleSplitPane(self: *Server, params: msgpack.Value) !msgpack.Value {
+        // Parse direction from params: { direction: "row"|"col" }
+        var direction: []const u8 = "row";
+        if (params == .map) {
+            for (params.map) |kv| {
+                if (kv.key == .string and std.mem.eql(u8, kv.key.string, "direction")) {
+                    if (kv.value == .string) {
+                        direction = kv.value.string;
+                    }
+                }
+            }
+        }
+
+        // Find any client that has attached PTYs and send them the create_split notification
+        for (self.clients.items) |client| {
+            if (client.attached_ptys.items.len > 0) {
+                var map_items = try self.allocator.alloc(msgpack.Value.KeyValue, 1);
+                map_items[0] = .{
+                    .key = .{ .string = "direction" },
+                    .value = .{ .string = direction },
+                };
+                const notif_params = msgpack.Value{ .map = map_items };
+                const msg_bytes = try msgpack.encode(self.allocator, .{ 2, "create_split", notif_params });
+                defer self.allocator.free(msg_bytes);
+                defer self.allocator.free(map_items);
+
+                try client.sendData(self.loop, msg_bytes);
+                return msgpack.Value.nil;
+            }
+        }
+
+        return msgpack.Value{ .string = try self.allocator.dupe(u8, "no attached clients") };
+    }
+
     fn handleGetServerInfo(self: *Server) !msgpack.Value {
         const entries = try self.allocator.alloc(msgpack.Value.KeyValue, 2);
         entries[0] = .{
@@ -2459,6 +2493,8 @@ const Server = struct {
             return self.handleGetSelection(params);
         } else if (std.mem.eql(u8, method, "clear_selection")) {
             return self.handleClearSelection(params);
+        } else if (std.mem.eql(u8, method, "split_pane")) {
+            return self.handleSplitPane(params);
         } else {
             return msgpack.Value{ .string = try self.allocator.dupe(u8, "unknown method") };
         }

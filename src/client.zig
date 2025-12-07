@@ -217,6 +217,7 @@ pub const ServerAction = union(enum) {
     color_query: ColorQueryTarget,
     server_info: struct { pty_validity: i64 },
     copy_to_clipboard: []const u8,
+    create_split: struct { direction: []const u8 },
 
     pub const ColorQueryTarget = struct {
         pty_id: u32,
@@ -389,6 +390,22 @@ pub const ClientLogic = struct {
             return try handleCwdChanged(state, notif.params);
         } else if (std.mem.eql(u8, notif.method, "color_query")) {
             return parseColorQuery(notif.params);
+        } else if (std.mem.eql(u8, notif.method, "create_split")) {
+            return parseCreateSplit(notif.params);
+        }
+        return .none;
+    }
+
+    fn parseCreateSplit(params: msgpack.Value) ServerAction {
+        if (params != .map) return .none;
+
+        for (params.map) |kv| {
+            if (kv.key != .string) continue;
+            if (std.mem.eql(u8, kv.key.string, "direction")) {
+                if (kv.value == .string) {
+                    return .{ .create_split = .{ .direction = kv.value.string } };
+                }
+            }
         }
         return .none;
     }
@@ -2455,6 +2472,9 @@ pub const App = struct {
                             .copy_to_clipboard => |text| {
                                 app.copyToClipboard(text);
                             },
+                            .create_split => |split| {
+                                app.handleCreateSplit(split.direction);
+                            },
                             .none => {},
                         }
 
@@ -2566,6 +2586,11 @@ pub const App = struct {
         defer self.allocator.free(msg);
 
         try self.sendDirect(msg);
+    }
+
+    fn handleCreateSplit(self: *App, direction: []const u8) void {
+        // Tell Lua UI to create a split, then spawn a PTY
+        self.ui.createSplit(direction);
     }
 
     fn copyToClipboard(self: *App, text: []const u8) void {
