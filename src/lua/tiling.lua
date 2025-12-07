@@ -187,6 +187,105 @@ local state = {
 
 local M = {}
 
+-- Command usage tracking for frecency-based ordering
+-- Uses LRFU algorithm: score decays over time but accumulates with usage
+local command_usage = {}
+local USAGE_DECAY_FACTOR = 0.9 -- How much scores decay per day (0.5 = pure recency, 1.0 = pure frequency)
+local usage_file_path = nil
+
+---Get the usage file path
+---@return string?
+local function get_usage_file_path()
+    if usage_file_path then
+        return usage_file_path
+    end
+    local home = os.getenv("HOME")
+    if not home then
+        return nil
+    end
+    usage_file_path = home .. "/.local/state/prise/command_usage.json"
+    return usage_file_path
+end
+
+---Load command usage from disk
+local function load_command_usage()
+    local path = get_usage_file_path()
+    if not path then
+        return
+    end
+    local file = io.open(path, "r")
+    if not file then
+        return
+    end
+    local content = file:read("*a")
+    file:close()
+    if content and content ~= "" then
+        -- Simple JSON parsing for our flat structure: {"cmd_name": {"count": N, "last_used": T}, ...}
+        for name, count, last_used in content:gmatch('"([^"]+)":%s*{%s*"count":%s*(%d+),%s*"last_used":%s*(%d+)%s*}') do
+            command_usage[name] = {
+                count = tonumber(count) or 0,
+                last_used = tonumber(last_used) or 0,
+            }
+        end
+    end
+end
+
+---Save command usage to disk
+local function save_command_usage()
+    local path = get_usage_file_path()
+    if not path then
+        return
+    end
+    -- Ensure directory exists
+    local dir = path:match("(.+)/[^/]+$")
+    if dir then
+        os.execute('mkdir -p "' .. dir .. '"')
+    end
+    local file = io.open(path, "w")
+    if not file then
+        return
+    end
+    local parts = {}
+    for name, data in pairs(command_usage) do
+        table.insert(parts, string.format('"%s": {"count": %d, "last_used": %d}', name, data.count, data.last_used))
+    end
+    file:write("{" .. table.concat(parts, ", ") .. "}")
+    file:close()
+end
+
+---Calculate frecency score for a command
+---@param name string Command name
+---@return number score
+local function get_frecency_score(name)
+    local data = command_usage[name]
+    if not data or data.count == 0 then
+        return 0
+    end
+    -- Hours since last use
+    local now = os.time()
+    local hours_since_use = (now - data.last_used) / 3600
+    local days_since_use = hours_since_use / 24
+    -- Score decays exponentially with time
+    local decay = USAGE_DECAY_FACTOR ^ days_since_use
+    return data.count * decay
+end
+
+---Record that a command was used
+---@param name string Command name
+local function record_command_usage(name)
+    local data = command_usage[name]
+    if not data then
+        command_usage[name] = { count = 1, last_used = os.time() }
+    else
+        data.count = data.count + 1
+        data.last_used = os.time()
+    end
+    save_command_usage()
+end
+
+-- Load usage data on module load
+load_command_usage()
+
 ---Configure the default UI
 ---@param opts? PriseConfig Configuration options to merge
 function M.setup(opts)
@@ -1243,6 +1342,15 @@ local function filter_commands(query)
             end
         end
     end
+    -- Sort by frecency score (highest first), then alphabetically for ties
+    table.sort(results, function(a, b)
+        local score_a = get_frecency_score(a.name)
+        local score_b = get_frecency_score(b.name)
+        if score_a ~= score_b then
+            return score_a > score_b
+        end
+        return a.name < b.name
+    end)
     return results
 end
 
@@ -1264,9 +1372,11 @@ end
 
 local function execute_selected()
     local filtered = filter_commands(state.palette.input:text())
-    if filtered[state.palette.selected] then
+    local selected_cmd = filtered[state.palette.selected]
+    if selected_cmd then
+        record_command_usage(selected_cmd.name)
         close_palette()
-        filtered[state.palette.selected].action()
+        selected_cmd.action()
     end
 end
 

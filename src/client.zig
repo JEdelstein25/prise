@@ -2523,9 +2523,23 @@ pub const App = struct {
 
     fn sendDirect(self: *App, data: []const u8) !void {
         var index: usize = 0;
+        var retries: usize = 0;
+        const max_retries: usize = 100; // ~100ms max wait
         while (index < data.len) {
-            const n = try posix.write(self.fd, data[index..]);
+            const n = posix.write(self.fd, data[index..]) catch |err| {
+                if (err == error.WouldBlock) {
+                    retries += 1;
+                    if (retries >= max_retries) {
+                        log.warn("sendDirect: dropping message after {} retries", .{retries});
+                        return; // Drop message rather than error
+                    }
+                    std.Thread.sleep(1 * std.time.ns_per_ms);
+                    continue;
+                }
+                return err;
+            };
             index += n;
+            retries = 0;
         }
     }
 
