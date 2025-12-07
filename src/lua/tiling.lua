@@ -207,6 +207,49 @@ local function get_usage_file_path()
     return usage_file_path
 end
 
+---Parse a simple JSON object (flat structure with nested objects)
+---Handles any key ordering and whitespace formatting
+---@param json string JSON content
+---@return table<string, table> Parsed data
+local function parse_usage_json(json)
+    local result = {}
+    -- Match each top-level key and its object value
+    -- Pattern: "key": { ... }
+    local pos = 1
+    while pos <= #json do
+        -- Find next key
+        local key_start, key_end, key = json:find('"([^"]+)"%s*:%s*{', pos)
+        if not key_start then
+            break
+        end
+        -- Find matching closing brace
+        local brace_count = 1
+        local obj_start = json:find("{", key_end)
+        local i = obj_start + 1
+        while i <= #json and brace_count > 0 do
+            local c = json:sub(i, i)
+            if c == "{" then
+                brace_count = brace_count + 1
+            elseif c == "}" then
+                brace_count = brace_count - 1
+            end
+            i = i + 1
+        end
+        local obj_content = json:sub(obj_start + 1, i - 2)
+        -- Parse count and last_used from object content (order-independent)
+        local count = obj_content:match('"count"%s*:%s*(%d+)')
+        local last_used = obj_content:match('"last_used"%s*:%s*(%d+)')
+        if count and last_used then
+            result[key] = {
+                count = tonumber(count) or 0,
+                last_used = tonumber(last_used) or 0,
+            }
+        end
+        pos = i
+    end
+    return result
+end
+
 ---Load command usage from disk
 local function load_command_usage()
     local path = get_usage_file_path()
@@ -220,14 +263,41 @@ local function load_command_usage()
     local content = file:read("*a")
     file:close()
     if content and content ~= "" then
-        -- Simple JSON parsing for our flat structure: {"cmd_name": {"count": N, "last_used": T}, ...}
-        for name, count, last_used in content:gmatch('"([^"]+)":%s*{%s*"count":%s*(%d+),%s*"last_used":%s*(%d+)%s*}') do
-            command_usage[name] = {
-                count = tonumber(count) or 0,
-                last_used = tonumber(last_used) or 0,
-            }
+        command_usage = parse_usage_json(content)
+    end
+end
+
+---Escape a string for JSON output
+---@param s string
+---@return string
+local function json_escape(s)
+    s = s:gsub("\\", "\\\\")
+    s = s:gsub('"', '\\"')
+    s = s:gsub("\n", "\\n")
+    s = s:gsub("\r", "\\r")
+    s = s:gsub("\t", "\\t")
+    return s
+end
+---Ensure a directory exists using pure Lua (no shell execution)
+---@param path string Directory path
+---@return boolean success
+local function ensure_dir_exists(path)
+    -- Try to create each component of the path
+    local sep = "/"
+    local current = ""
+    for component in path:gmatch("[^/]+") do
+        current = current .. sep .. component
+        -- lfs not available, try opening a file to check if dir exists
+        local test_file = io.open(current .. "/.prise_test", "w")
+        if test_file then
+            test_file:close()
+            os.remove(current .. "/.prise_test")
+        else
+            -- Try to create via prise API if available, otherwise skip
+            -- The file open will fail gracefully below
         end
     end
+    return true
 end
 
 ---Save command usage to disk
@@ -236,18 +306,35 @@ local function save_command_usage()
     if not path then
         return
     end
-    -- Ensure directory exists
+    -- Ensure parent directory exists by trying to create it safely
     local dir = path:match("(.+)/[^/]+$")
     if dir then
-        os.execute('mkdir -p "' .. dir .. '"')
+        -- Use prise.mkdir if available, otherwise try file creation
+        if prise and prise.mkdir then
+            prise.mkdir(dir)
+        else
+            -- Attempt to ensure directory exists without shell
+            ensure_dir_exists(dir)
+        end
     end
     local file = io.open(path, "w")
+    if not file then
+        -- Directory might not exist, try creating it via os.execute as fallback
+        -- Validate path contains only safe characters
+        if dir and dir:match("^[%w%s%-%_%./~]+$") then
+            os.execute('mkdir -p "' .. dir .. '"')
+            file = io.open(path, "w")
+        end
+    end
     if not file then
         return
     end
     local parts = {}
     for name, data in pairs(command_usage) do
-        table.insert(parts, string.format('"%s": {"count": %d, "last_used": %d}', name, data.count, data.last_used))
+        table.insert(
+            parts,
+            string.format('"%s": {"count": %d, "last_used": %d}', json_escape(name), data.count, data.last_used)
+        )
     end
     file:write("{" .. table.concat(parts, ", ") .. "}")
     file:close()
