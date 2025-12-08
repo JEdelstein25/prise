@@ -1676,6 +1676,24 @@ function M.update(event)
             return
         end
 
+        -- Shift+WASD for pane focus navigation
+        if event.data.shift and not event.data.ctrl and not event.data.alt and not event.data.super then
+            local k = event.data.key
+            if k == "W" then
+                move_focus("up")
+                return
+            elseif k == "A" then
+                move_focus("left")
+                return
+            elseif k == "S" then
+                move_focus("down")
+                return
+            elseif k == "D" then
+                move_focus("right")
+                return
+            end
+        end
+
         -- Copy selection: Cmd+c (macOS) or Ctrl+Shift+c (Linux)
         if event.data.key == "c" then
             local is_copy = false
