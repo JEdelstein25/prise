@@ -29,11 +29,55 @@ review_comments=$(echo "$inline_comments" | jq '[.[] | {
 inline_count=$(echo "$review_comments" | jq 'length')
 echo "Posting review with $inline_count inline comments"
 
+# Get the list of changed lines in the PR diff
+# This creates a JSON object mapping "file:line" to true for all lines in the diff
+diff_lines=$(gh api "repos/$REPO/pulls/$PR_NUMBER/files" --jq '
+  [.[] | .filename as $file | .patch // "" |
+   split("\n") | to_entries | reduce .[] as $entry (
+     {line: 0, result: []};
+     if ($entry.value | startswith("@@")) then
+       # Parse hunk header like "@@ -1,3 +4,5 @@" to get the new file line number
+       .line = ($entry.value | capture("@@ -[0-9]+(,[0-9]+)? \\+(?<start>[0-9]+)") | .start | tonumber)
+     elif ($entry.value | startswith("-")) then
+       .  # Deleted lines do not increment the line counter
+     elif ($entry.value | startswith("+")) then
+       .result += ["\($file):\(.line)"] | .line += 1
+     else
+       .line += 1
+     end
+   ) | .result
+  ] | flatten | map({(.): true}) | add // {}
+')
+
+# Filter inline comments to only include those on lines in the diff
+# Comments on lines not in the diff are converted to general comments
+filtered_inline=$(echo "$review_comments" | jq --argjson diff "$diff_lines" '
+  [.[] | select($diff["\(.path):\(.line)"] == true)]
+')
+orphan_comments=$(echo "$review_comments" | jq --argjson diff "$diff_lines" '
+  [.[] | select($diff["\(.path):\(.line)"] != true) |
+   "**\(.path):\(.line)**: \(.body)"]
+')
+
+# Add orphan comments to the body
+orphan_body=$(echo "$orphan_comments" | jq -r 'if length > 0 then join("\n\n") else "" end')
+if [[ -n "$orphan_body" && "$orphan_body" != "" ]]; then
+  if [[ -n "$body" && "$body" != "" ]]; then
+    body="$body"$'\n\n'"$orphan_body"
+  else
+    body="$orphan_body"
+  fi
+fi
+
+filtered_count=$(echo "$filtered_inline" | jq 'length')
+orphan_count=$(echo "$orphan_comments" | jq 'length')
+echo "Filtered to $filtered_count inline comments ($orphan_count moved to body)"
+
 # Build the review payload
 payload=$(jq -n \
   --arg commit_id "$HEAD_SHA" \
   --arg body "$body" \
-  --argjson comments "$review_comments" \
+  --argjson comments "$filtered_inline" \
   '{
     commit_id: $commit_id,
     event: "COMMENT",

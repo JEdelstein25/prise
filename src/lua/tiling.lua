@@ -1,4 +1,5 @@
 local prise = require("prise")
+local utils = require("utils")
 
 ---@class Pane
 ---@field type "pane"
@@ -94,8 +95,15 @@ local POWERLINE_SYMBOLS = {
 ---@field leader? PriseKeybind Key to enter command mode (default: super+k)
 ---@field palette? PriseKeybind Key to open command palette (default: super+p)
 
+---@class PriseBordersConfig
+---@field enabled? boolean Show pane borders (default: false)
+---@field style? "none"|"single"|"double"|"rounded" Border style (default: "single")
+---@field focused_color? string Hex color for focused pane border (default: "#89b4fa")
+---@field unfocused_color? string Hex color for unfocused borders (default: "#585b70")
+
 ---@class PriseConfig
 ---@field theme? PriseTheme Color theme options
+---@field borders? PriseBordersConfig Pane border options
 ---@field status_bar? PriseStatusBarConfig Status bar options
 ---@field tab_bar? PriseTabBarConfig Tab bar options
 ---@field keybinds? PriseKeybinds Keybind configuration
@@ -122,6 +130,12 @@ local config = {
         green = "#a6e3a1", -- Success/connected
         yellow = "#f9e2af", -- Warning
     },
+    borders = {
+        enabled = false,
+        style = "single",
+        focused_color = "#89b4fa", -- Blue (matches default theme.accent)
+        unfocused_color = "#585b70", -- Gray (matches default theme.bg4)
+    },
     status_bar = {
         enabled = true,
     },
@@ -134,18 +148,7 @@ local config = {
     },
 }
 
----Deep merge tables (source into target)
----@param target table
----@param source table
-local function deep_merge(target, source)
-    for k, v in pairs(source) do
-        if type(v) == "table" and type(target[k]) == "table" then
-            deep_merge(target[k], v)
-        else
-            target[k] = v
-        end
-    end
-end
+local merge_config = utils.merge_config
 
 -- Convenience alias for theme access
 local THEME = config.theme
@@ -196,7 +199,7 @@ local M = {}
 ---@param opts? PriseConfig Configuration options to merge
 function M.setup(opts)
     if opts then
-        deep_merge(config, opts)
+        merge_config(config, opts)
     end
 end
 
@@ -1885,11 +1888,25 @@ local function render_node(node, force_unfocused)
         prise.log.debug(
             "render_node: force_unfocused=" .. tostring(force_unfocused) .. " is_focused=" .. tostring(is_focused)
         )
-        return prise.Terminal({
+        local terminal = prise.Terminal({
             pty = node.pty,
             ratio = node.ratio,
             focus = is_focused,
         })
+
+        -- Wrap in Box if borders are enabled
+        if config.borders.enabled then
+            local border_color = is_focused and config.borders.focused_color or config.borders.unfocused_color
+
+            return prise.Box({
+                border = config.borders.style,
+                style = { fg = border_color },
+                child = terminal,
+                ratio = node.ratio, -- Propagate ratio for layout system
+            })
+        else
+            return terminal
+        end
     elseif is_split(node) then
         local children_widgets = {}
         for _, child in ipairs(node.children) do
@@ -2213,10 +2230,21 @@ function M.view()
         local path = find_node_path(root, state.zoomed_pane_id)
         if path then
             local pane = path[#path]
-            content = prise.Terminal({
+            local terminal = prise.Terminal({
                 pty = pane.pty,
                 focus = not overlay_visible,
             })
+
+            -- Apply borders to zoomed pane if enabled
+            if config.borders.enabled then
+                content = prise.Box({
+                    border = config.borders.style,
+                    style = { fg = config.borders.focused_color }, -- Zoomed pane is always focused
+                    child = terminal,
+                })
+            else
+                content = terminal
+            end
         else
             state.zoomed_pane_id = nil
             content = render_node(root, overlay_visible)
@@ -2342,5 +2370,17 @@ function M.set_state(saved, pty_lookup)
 
     prise.request_frame()
 end
+
+-- Export internal functions for testing
+M._test = {
+    matches_keybind = matches_keybind,
+    is_pane = is_pane,
+    is_split = is_split,
+    collect_panes = collect_panes,
+    find_node_path = find_node_path,
+    get_first_leaf = get_first_leaf,
+    get_last_leaf = get_last_leaf,
+    format_palette_item = format_palette_item,
+}
 
 return M
